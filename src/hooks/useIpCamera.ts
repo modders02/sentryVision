@@ -23,12 +23,26 @@ interface IpCamState {
   audioEnabled: boolean;
 }
 
+const CAPTURE_FPS = 10;
+const MAX_CAPTURE_WIDTH = 640;
+
+function fitCanvas(canvas: HTMLCanvasElement, width: number, height: number) {
+  const scale = Math.min(1, MAX_CAPTURE_WIDTH / width);
+  const fittedWidth = Math.max(1, Math.round(width * scale));
+  const fittedHeight = Math.max(1, Math.round(height * scale));
+  if (canvas.width !== fittedWidth || canvas.height !== fittedHeight) {
+    canvas.width = fittedWidth;
+    canvas.height = fittedHeight;
+  }
+}
+
 const session = {
   state: { stream: null, error: null, connected: false, audioEnabled: false } as IpCamState,
   video: null as HTMLVideoElement | null,
   hls: null as Hls | null,
   canvas: null as HTMLCanvasElement | null,
-  raf: 0 as number,
+  image: null as HTMLImageElement | null,
+  timer: 0 as number,
   listeners: new Set<() => void>(),
 };
 
@@ -46,7 +60,13 @@ function disconnectSession() {
     session.video.remove();
     session.video = null;
   }
-  if (session.raf) { cancelAnimationFrame(session.raf); clearTimeout(session.raf); session.raf = 0; }
+  if (session.timer) { window.clearTimeout(session.timer); session.timer = 0; }
+  if (session.image) {
+    session.image.onload = null;
+    session.image.onerror = null;
+    session.image.removeAttribute('src');
+    session.image = null;
+  }
   session.canvas = null;
   session.state.stream?.getTracks().forEach(t => t.stop());
   setState({ stream: null, connected: false, audioEnabled: false, error: null });
@@ -80,6 +100,7 @@ async function connectSession(cfg: IpCamConfig) {
           hls.on(Hls.Events.MANIFEST_PARSED, () => res());
           hls.on(Hls.Events.ERROR, (_e, data) => { if (data.fatal) rej(new Error(data.details || 'HLS error')); });
         });
+        if (session.video !== video) return false;
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = cfg.url;
       } else {
@@ -99,6 +120,7 @@ async function connectSession(cfg: IpCamConfig) {
         if (!transient) throw err;
         console.debug('[IpCamera] transient play() interruption; waiting for HLS media to settle');
       }
+      if (session.video !== video) return false;
 
       // Wait for real video dimensions before capturing, otherwise the
       // resulting track is a black 0x0 / not-yet-decoded surface.
@@ -109,29 +131,25 @@ async function connectSession(cfg: IpCamConfig) {
         video.addEventListener('resize', done);
         setTimeout(done, 8000);
       });
+      if (session.video !== video) return false;
 
       if (!video.videoWidth) throw new Error('Stream produced no video frames (codec may be H.265 — force H.264 on the camera)');
 
       // Pump frames through a canvas: this works for MSE/hls.js in every
       // browser, whereas video.captureStream() often yields a black track.
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      fitCanvas(canvas, video.videoWidth, video.videoHeight);
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('Canvas unavailable');
       const draw = () => {
-        if (!session.canvas || !session.video) return;
-        const v = session.video;
-        if (v.readyState >= 2 && v.videoWidth) {
-          if (canvas.width !== v.videoWidth || canvas.height !== v.videoHeight) {
-            canvas.width = v.videoWidth;
-            canvas.height = v.videoHeight;
-          }
-          try { ctx.drawImage(v, 0, 0, canvas.width, canvas.height); } catch { /* tainted */ }
+        if (session.canvas !== canvas || session.video !== video) return;
+        if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
+          fitCanvas(canvas, video.videoWidth, video.videoHeight);
+          try { ctx.drawImage(video, 0, 0, canvas.width, canvas.height); } catch { /* tainted */ }
         }
-        session.raf = requestAnimationFrame(draw);
+        session.timer = window.setTimeout(draw, 1000 / CAPTURE_FPS);
       };
       draw();
-      const ms = (canvas as HTMLCanvasElement & { captureStream: (fps?: number) => MediaStream }).captureStream(30);
+      const ms = canvas.captureStream(CAPTURE_FPS);
       setState({ stream: ms });
     } else if (cfg.kind === 'mjpeg' || cfg.kind === 'image') {
       // For MJPEG we draw into a canvas at ~10fps and captureStream from it
@@ -140,35 +158,34 @@ async function connectSession(cfg: IpCamConfig) {
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('Canvas unavailable');
 
-      let img: HTMLImageElement | null = null;
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      session.image = img;
       const loop = () => {
-        if (!session.canvas) return;
-        if (!img) {
-          img = new Image();
-          img.crossOrigin = 'anonymous';
-        }
+        if (session.canvas !== canvas) return;
         // Cache-bust for MJPEG snapshot URLs
         const sep = cfg.url.includes('?') ? '&' : '?';
-        img.src = cfg.kind === 'mjpeg' ? cfg.url : `${cfg.url}${sep}t=${Date.now()}`;
         img.onload = () => {
+          if (session.canvas !== canvas) return;
           try {
-            canvas.width = img!.naturalWidth || 640;
-            canvas.height = img!.naturalHeight || 480;
-            ctx.drawImage(img!, 0, 0, canvas.width, canvas.height);
+            fitCanvas(canvas, img.naturalWidth || 640, img.naturalHeight || 480);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           } catch { /* ignore */ }
-          session.raf = window.setTimeout(loop, 100) as unknown as number;
+          session.timer = window.setTimeout(loop, 1000 / CAPTURE_FPS);
         };
         img.onerror = () => {
-          session.raf = window.setTimeout(loop, 500) as unknown as number;
+          if (session.canvas === canvas) session.timer = window.setTimeout(loop, 500);
         };
+        img.src = cfg.kind === 'mjpeg' ? cfg.url : `${cfg.url}${sep}t=${Date.now()}`;
       };
       loop();
-      const ms: MediaStream = (canvas as HTMLCanvasElement & { captureStream: (fps?: number) => MediaStream }).captureStream(15);
+      const ms = canvas.captureStream(CAPTURE_FPS);
       setState({ stream: ms });
     }
     setState({ connected: true });
     return true;
   } catch (err) {
+    if (session.video !== video) return false;
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[IpCamera] connect failed:', msg);
     disconnectSession();
@@ -210,6 +227,7 @@ export function useIpCamera() {
     connect,
     disconnect,
     stream: state.stream,
+    video: session.video,
     connected: state.connected,
     error: state.error,
     audioEnabled: state.audioEnabled,

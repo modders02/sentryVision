@@ -17,6 +17,7 @@ export interface CameraSlot {
   aiEnabled: boolean;
   /** HLS URL reported by the backend after Connect. */
   streamUrl?: string;
+  webrtcUrl?: string;
   /** True once the backend confirmed ffmpeg + HLS for this slot. */
   connected?: boolean;
 }
@@ -131,6 +132,7 @@ export const slotCamera = (slot: CameraSlot): CameraConfig => ({
   location: slot.ip ? `Camera IP ${slot.ip}` : '',
   rtspUrl: slotRtsp(slot),
   streamUrl: slot.streamUrl || '',
+  webrtcUrl: slot.webrtcUrl || '',
   enabled: !!slot.ip.trim() && !!slot.connected,
   aiEnabled: slot.aiEnabled,
   recording: false,

@@ -1,6 +1,6 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
-import * as cocoSsd from '@tensorflow-models/coco-ssd';
-import '@tensorflow/tfjs';
+import type { ObjectDetection } from '@tensorflow-models/coco-ssd';
+import { loadDetector } from '@/lib/detectionEngine';
 import type { DetectedObject } from '@/types/dashboard';
 
 // No hardcoded filter — use priorityObjects param from caller
@@ -54,7 +54,7 @@ interface DetectionStats {
 }
 
 export function useObjectDetection() {
-  const modelRef = useRef<cocoSsd.ObjectDetection | null>(null);
+  const modelRef = useRef<ObjectDetection | null>(null);
   const [stats, setStats] = useState<DetectionStats>({
     totalDetected: 0,
     filteredPriority: 0,
@@ -63,23 +63,32 @@ export function useObjectDetection() {
     modelError: null,
   });
   const detectingRef = useRef(false);
+  const loadingRef = useRef(false);
+  const mountedRef = useRef(true);
   const prevDetsRef = useRef<DetectedObject[]>([]);
 
   const loadModel = useCallback(async () => {
-    if (modelRef.current || stats.modelLoading) return;
+    if (modelRef.current || loadingRef.current || !mountedRef.current) return;
+    loadingRef.current = true;
     setStats(prev => ({ ...prev, modelLoading: true, modelError: null }));
     try {
       console.log('[ObjectDetection] Loading COCO-SSD model...');
-      const model = await cocoSsd.load({ base: 'mobilenet_v2' });
+      // Every camera shares the same weights; filtering and temporal state
+      // below remain local to this hook.
+      const model = await loadDetector();
+      if (!mountedRef.current) return;
       modelRef.current = model;
       console.log('[ObjectDetection] Model loaded successfully.');
       setStats(prev => ({ ...prev, modelLoaded: true, modelLoading: false }));
     } catch (err) {
+      if (!mountedRef.current) return;
       const message = err instanceof Error ? err.message : 'Unknown error loading model';
       console.error('[ObjectDetection] Model load failed:', message);
       setStats(prev => ({ ...prev, modelLoading: false, modelError: message }));
+    } finally {
+      loadingRef.current = false;
     }
-  }, [stats.modelLoading]);
+  }, []);
 
   const detect = useCallback(async (
     source: HTMLVideoElement | HTMLCanvasElement,
@@ -146,7 +155,9 @@ export function useObjectDetection() {
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       modelRef.current = null;
     };
   }, []);

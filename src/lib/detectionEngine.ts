@@ -14,6 +14,9 @@ export function loadDetector() {
     modelPromise = cocoSsd.load({ base: 'mobilenet_v2' }).then(m => {
       model = m;
       return m;
+    }).catch(error => {
+      modelPromise = null;
+      throw error;
     });
   }
   return modelPromise;

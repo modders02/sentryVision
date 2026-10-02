@@ -1,256 +1,91 @@
-import IdleHint from '@/components/IdleHint';
-import { useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Shield, X, Camera, Filter, Trash2, Grid2x2, Square as SquareIcon, Columns2, Settings, FolderOpen, Film } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { ArrowLeft, Camera, Columns2, Grid2x2, LayoutDashboard, VideoOff } from 'lucide-react';
 import { useCameraRegistry } from '@/hooks/useCameraRegistry';
-import { useCameraSlots, slotCamera, slotSettings, type SlotCount } from '@/hooks/useCameraSlots';
-import CameraTile from '@/components/multicam/CameraTile';
-import {
-  clipFolderSupported, getClipFolderLabel, getClipSeconds, pickClipFolder, setClipSeconds,
-} from '@/lib/clipRecorder';
-import type { DetectionEvent } from '@/types/multicam';
+import { useCamera } from '@/hooks/useCamera';
+import { useCameraSlots, slotCamera, slotSettings, type CameraSlot } from '@/hooks/useCameraSlots';
+import LiveCameraFeed from '@/components/multicam/LiveCameraFeed';
+import DashboardEvents from '@/components/dashboard/DashboardEvents';
 
-const typeIcon: Record<string, string> = {
-  fire: '🔥', smoke: '💨', human: '🧍', object: '📦',
-  'face-distress': '😨', 'audio-distress': '🗣️', saliency: '✨',
-};
-
+/** Displays existing monitoring sessions; changing the view never starts another pipeline. */
 export default function Monitoring() {
   const navigate = useNavigate();
-  const { settings, events, addEvent, updateEvent, clearEvents } = useCameraRegistry();
-  const { count, activeSlots, setCount } = useCameraSlots();
-  const [focused, setFocused] = useState<string | null>(null);
-  const [filter, setFilter] = useState<string>('all');
-  const [showSettings, setShowSettings] = useState(false);
-  const [folder, setFolder] = useState(getClipFolderLabel());
-  const [seconds, setSeconds] = useState(getClipSeconds());
-  const [folderError, setFolderError] = useState('');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { settings } = useCameraRegistry();
+  const { slots, count } = useCameraSlots();
+  const { cameras } = useCamera();
+  const requestedCamera = searchParams.get('camera');
+  const isConnected = (slot: CameraSlot) => !!cameras[slot.index - 1]?.active || !!(slot.ip.trim() && slot.connected);
+  const includedSlots = slots.filter(slot => slot.index <= count || isConnected(slot) || requestedCamera === `slot-${slot.index}`);
+  const [columns, setColumns] = useState<1 | 2>(2);
+  const focused = includedSlots.some(slot => `slot-${slot.index}` === requestedCamera) ? requestedCamera : null;
+  const visible = focused ? includedSlots.filter(slot => `slot-${slot.index}` === focused) : includedSlots;
+  const connected = includedSlots.filter(isConnected);
 
-  const connected = useMemo(() => activeSlots.filter(s => s.ip.trim() && s.connected), [activeSlots]);
-  const visible = focused ? connected.filter(s => `slot-${s.index}` === focused) : connected;
-  const filtered = filter === 'all' ? events : events.filter(e => e.cameraId === filter);
-  const alerts = filtered.filter(e => ['fire', 'smoke', 'face-distress', 'audio-distress'].includes(e.type));
-
-  const handleEvent = (evt: Omit<DetectionEvent, 'id'>) => {
-    const id = crypto.randomUUID();
-    addEvent({ ...evt, id });
-    return id;
-  };
-
-  const chooseFolder = async () => {
-    setFolderError('');
-    try {
-      setFolder(await pickClipFolder());
-    } catch (err) {
-      setFolderError(err instanceof Error ? err.message : 'Could not open the folder picker.');
+  useEffect(() => {
+    if (searchParams.has('events')) {
+      document.getElementById('camera-events')?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
     }
-  };
+  }, [searchParams]);
 
-  const gridClass = count === 1 ? 'grid-cols-1' : count === 2 ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1 md:grid-cols-2';
+  const selectCamera = (cameraId: string | null) => {
+    const next = new URLSearchParams(searchParams);
+    if (cameraId) next.set('camera', cameraId);
+    else next.delete('camera');
+    next.delete('events');
+    setSearchParams(next);
+  };
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <header className="border-b border-border bg-card/60 backdrop-blur-sm px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-        <button onClick={() => navigate('/')} className="flex items-center gap-2 group">
-          <Shield className="w-6 h-6 text-primary" />
-          <h1 className="text-lg font-bold tracking-tight group-hover:text-primary transition-colors">MSDSystem</h1>
-        </button>
-        <div className="flex items-center gap-2">
-          <span className="text-[15px] font-semibold text-muted-foreground">
-            {connected.length} camera{connected.length === 1 ? '' : 's'} monitoring
-          </span>
-          <div className="flex items-center gap-1 bg-muted/50 rounded-lg p-1">
-            {([1, 2, 3, 4] as SlotCount[]).map(n => (
-              <button
-                key={n}
-                onClick={() => { setCount(n); setFocused(null); }}
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-[14px] font-semibold transition-colors ${
-                  count === n && !focused ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
-                }`}
-                title={`${n} camera layout`}
-              >
-                {n === 1 ? <SquareIcon className="w-4 h-4" /> : n === 2 ? <Columns2 className="w-4 h-4" /> : <Grid2x2 className="w-4 h-4" />}
-                {n}
-              </button>
-            ))}
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-card/60 px-4 py-4 backdrop-blur-sm sm:px-6">
+        <div className="flex items-center gap-3">
+          <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary"><Camera className="h-5 w-5" /></span>
+          <div>
+            <h1 className="text-xl font-bold tracking-tight">Live cameras</h1>
+            <p className="text-sm text-muted-foreground">{connected.length} connected camera{connected.length === 1 ? '' : 's'}</p>
           </div>
-          <button
-            onClick={() => navigate('/dashboard')}
-            className="flex items-center gap-1.5 text-[15px] font-semibold text-accent bg-accent/10 hover:bg-accent/20 px-3 py-1.5 rounded-full"
-          >
-            <Camera className="w-4 h-4" /> Dashboard
-          </button>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          {!focused && (
+            <div className="flex items-center gap-1 rounded-lg bg-muted/50 p-1" aria-label="Live camera layout">
+              <button onClick={() => setColumns(1)} aria-label="One column" aria-pressed={columns === 1} className={`rounded-md p-2 transition-colors ${columns === 1 ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted'}`}><Columns2 className="h-4 w-4 rotate-90" /></button>
+              <button onClick={() => setColumns(2)} aria-label="Camera grid" aria-pressed={columns === 2} className={`rounded-md p-2 transition-colors ${columns === 2 ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted'}`}><Grid2x2 className="h-4 w-4" /></button>
+            </div>
+          )}
+          <button onClick={() => navigate('/dashboard')} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm font-semibold hover:bg-muted"><LayoutDashboard className="h-4 w-4" /> Dashboard</button>
         </div>
       </header>
 
-      <main className="p-4 grid lg:grid-cols-[1fr_360px] gap-4">
-        <section>
-          {focused && (
-            <button
-              onClick={() => setFocused(null)}
-              className="mb-3 flex items-center gap-1.5 text-[15px] font-semibold text-muted-foreground hover:text-foreground"
-            >
-              <X className="w-4 h-4" /> Exit single-camera view
-            </button>
-          )}
-          {connected.length === 0 ? (
-            <div className="border border-dashed border-border rounded-lg p-10 text-center">
-              <p className="text-[17px] font-semibold mb-2">No cameras connected yet</p>
-              <p className="text-[15px] text-muted-foreground mb-4">
-                Open Connect on the dashboard, choose 1, 2 or 4 cameras and type each camera's local
-                server IP address. Every feed runs its own saliency detection pipeline.
-              </p>
-              <div className="relative inline-block">
-                <IdleHint message="Go to Connect to add your first camera" />
-                <button
-                  onClick={() => navigate('/dashboard')}
-                  className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-[15px] font-bold"
-                >
-                  Go to Connect
-                </button>
-              </div>
-            </div>
+      <main className="mx-auto max-w-[1600px] space-y-4 p-4 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          {focused ? (
+            <button onClick={() => selectCamera(null)} className="flex items-center gap-2 text-sm font-semibold text-muted-foreground hover:text-foreground"><ArrowLeft className="h-4 w-4" /> All live cameras</button>
           ) : (
-            <div className={`grid gap-4 ${focused ? 'grid-cols-1' : gridClass}`}>
-              {visible.map(slot => {
-                // Follow the AI On/Off choice made when connecting each camera.
-                const camera = slotCamera(slot);
-                return (
-                  <CameraTile
-                    key={slot.index}
-                    camera={camera}
-                    settings={slotSettings(slot, settings)}
-                    onEvent={handleEvent}
-                    onClip={(id, clipFile, clipUrl) => updateEvent(id, { clipFile, clipUrl })}
-                    onExpand={id => setFocused(prev => (prev === id ? null : id))}
-                    audioControls={slot.index !== 1}
-                  />
-                );
-              })}
-            </div>
+            <p className="text-sm text-muted-foreground">Select a camera to open its live feed, alerts, and event history.</p>
           )}
-        </section>
+          <label className="flex items-center gap-2 text-sm text-muted-foreground">
+            View
+            <select aria-label="Choose live camera" value={focused || 'all'} onChange={event => selectCamera(event.target.value === 'all' ? null : event.target.value)} className="rounded-lg border border-border bg-card px-3 py-2 text-foreground">
+              <option value="all">All cameras</option>
+              {includedSlots.map(slot => <option key={slot.index} value={`slot-${slot.index}`}>{slot.name || `Camera ${slot.index}`}</option>)}
+            </select>
+          </label>
+        </div>
 
-        {/* Alerts + Event history */}
-        <aside className="space-y-4">
-          <div className="bg-card border border-border rounded-lg">
-            <div className="px-3 py-2 border-b border-border flex items-center gap-2">
-              <span className="text-[15px] font-bold">Alerts</span>
-              <span className="text-[13px] text-muted-foreground">{alerts.length}</span>
-            </div>
-            <div className="max-h-64 overflow-y-auto divide-y divide-border">
-              {alerts.length === 0 && (
-                <p className="p-3 text-[14px] text-muted-foreground">No alerts yet.</p>
-              )}
-              {alerts.slice(0, 40).map(a => (
-                <div key={a.id} className="p-3">
-                  <div className="text-[15px] font-bold">
-                    {typeIcon[a.type]} {a.label}
-                  </div>
-                  <div className="text-[14px] text-muted-foreground">
-                    Camera: <span className="font-semibold text-foreground">{a.cameraName}</span>
-                    {a.location ? ` · ${a.location}` : ''}
-                  </div>
-                  <div className="text-[14px] text-muted-foreground">
-                    Confidence: {(a.confidence * 100).toFixed(0)}% · {new Date(a.timestamp).toLocaleTimeString()}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="bg-card border border-border rounded-lg">
-            <div className="px-3 py-2 border-b border-border flex items-center gap-2">
-              <Filter className="w-4 h-4 text-muted-foreground" />
-              <select
-                value={filter}
-                onChange={e => setFilter(e.target.value)}
-                className="flex-1 bg-background border border-border rounded px-2 py-1 text-[14px]"
-              >
-                <option value="all">All cameras</option>
-                {activeSlots.map(s => (
-                  <option key={s.index} value={`slot-${s.index}`}>{s.name}</option>
-                ))}
-              </select>
-              <button
-                onClick={() => setShowSettings(v => !v)}
-                className={`p-1.5 rounded hover:bg-muted ${showSettings ? 'text-primary' : 'text-muted-foreground'}`}
-                title="Recording settings"
-                aria-expanded={showSettings}
-              >
-                <Settings className="w-4 h-4" />
-              </button>
-              <button onClick={clearEvents} className="p-1.5 rounded hover:bg-muted" title="Clear history">
-                <Trash2 className="w-4 h-4 text-muted-foreground" />
-              </button>
-            </div>
-
-            {showSettings && (
-              <div className="px-3 py-3 border-b border-border bg-primary/5 space-y-2">
-                <p className="text-[14px] font-semibold">Where should emergency videos be saved?</p>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <button
-                    onClick={chooseFolder}
-                    disabled={!clipFolderSupported()}
-                    className="flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-[14px] font-semibold hover:bg-muted disabled:opacity-60"
-                  >
-                    <FolderOpen className="w-4 h-4" /> Choose folder
-                  </button>
-                  <span className="text-[14px] text-muted-foreground">
-                    {folder ? `Saving to “${folder}”` : 'Saving to your Downloads folder'}
-                  </span>
-                </div>
-                {!clipFolderSupported() && (
-                  <p className="text-[13px] text-muted-foreground">
-                    This browser cannot pick a folder, so clips go to Downloads.
-                  </p>
-                )}
-                {folderError && <p className="text-[13px] text-destructive">{folderError}</p>}
-                <label className="block text-[14px] font-semibold">
-                  Clip length: {seconds} seconds
-                  <input
-                    type="range"
-                    min={5}
-                    max={30}
-                    step={5}
-                    value={seconds}
-                    onChange={e => { const v = Number(e.target.value); setSeconds(v); setClipSeconds(v); }}
-                    className="w-full mt-1"
-                  />
-                </label>
-              </div>
-            )}
-
-            <div className="max-h-[420px] overflow-y-auto divide-y divide-border">
-              {filtered.length === 0 && (
-                <p className="p-3 text-[14px] text-muted-foreground">No events recorded.</p>
-              )}
-              {filtered.slice(0, 100).map(e => (
-                <div key={e.id} className="p-2.5 flex gap-2 items-start">
-                  {e.clipUrl ? (
-                    <video src={e.clipUrl} controls className="w-24 h-16 rounded border border-border bg-background" />
-                  ) : e.snapshot ? (
-                    <img src={e.snapshot} alt={`${e.type} snapshot from ${e.cameraName}`} className="w-16 h-12 object-cover rounded border border-border" />
-                  ) : (
-                    <div className="w-16 h-12 rounded bg-muted flex items-center justify-center text-lg">{typeIcon[e.type]}</div>
-                  )}
-                  <div className="min-w-0">
-                    <div className="text-[14px] font-semibold truncate">{e.label}</div>
-                    <div className="text-[13px] text-muted-foreground truncate">
-                      {e.cameraName}{e.location ? ` · ${e.location}` : ''} · {(e.confidence * 100).toFixed(0)}%
-                    </div>
-                    <div className="text-[13px] text-muted-foreground">{new Date(e.timestamp).toLocaleString()}</div>
-                    {e.clipFile && (
-                      <div className="flex items-center gap-1 text-[13px] text-primary truncate">
-                        <Film className="w-3.5 h-3.5 shrink-0" /> {e.clipFile}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </aside>
+        <div className={`grid gap-5 ${focused || columns === 1 ? 'grid-cols-1' : 'grid-cols-1 lg:grid-cols-2'}`}>
+          {visible.map(slot => isConnected(slot) ? (
+            <LiveCameraFeed key={slot.index} camera={slotCamera(slot)} settings={slotSettings(slot, settings)} onExpand={focused ? undefined : selectCamera} onConnect={() => navigate(`/dashboard?connect=${slot.index}`)} />
+          ) : (
+            <button key={slot.index} onClick={() => navigate(`/dashboard?connect=${slot.index}`)} className="flex min-h-[300px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border bg-card/60 p-8 text-center transition-colors hover:border-primary hover:bg-primary/5">
+              <VideoOff className="h-8 w-8 text-muted-foreground" />
+              <span className="text-lg font-semibold">{slot.name || `Camera ${slot.index}`}</span>
+              <span className="text-sm text-muted-foreground">Camera not connected</span>
+              <span className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">Connect CCTV</span>
+            </button>
+          ))}
+        </div>
+        <DashboardEvents initialFilter={focused || 'all'} />
       </main>
     </div>
   );

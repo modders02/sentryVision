@@ -2,6 +2,7 @@ import type { QualityMode } from '@/types/dashboard';
 import { INDOOR_OBJECTS, DEFAULT_PRIORITY_OBJECTS } from '@/types/dashboard';
 
 interface ControlsPanelProps {
+  snapshotMode?: boolean;
   running: boolean;
   threshold: number;
   showBoundingBoxes: boolean;
@@ -30,7 +31,7 @@ interface ControlsPanelProps {
 
 export default function ControlsPanel(props: ControlsPanelProps) {
   const {
-    running, threshold, showBoundingBoxes, showHeatmap, showAlerts,
+    snapshotMode = false, running, threshold, showBoundingBoxes, showHeatmap, showAlerts,
     quality, mirror, heatmapOpacity, simulationMode, priorityObjects, minConfidence,
     onStart, onStop, onThresholdChange,
     onToggleBoundingBoxes, onToggleHeatmap, onToggleAlerts,
@@ -59,7 +60,7 @@ export default function ControlsPanel(props: ControlsPanelProps) {
           { label: 'Alerts', active: showAlerts, toggle: onToggleAlerts },
           { label: 'Mirror', active: mirror, toggle: onToggleMirror },
           { label: 'Simulate', active: simulationMode, toggle: onToggleSimulation },
-        ].map(({ label, active, toggle }) => (
+        ].filter(({ label }) => !snapshotMode || label === 'Alerts' || label === 'Mirror').map(({ label, active, toggle }) => (
           <button
             key={label}
             onClick={toggle}
@@ -94,7 +95,7 @@ export default function ControlsPanel(props: ControlsPanelProps) {
       {/* Threshold */}
       <div className="space-y-1">
         <div className="flex justify-between">
-          <span className="text-[10px] font-mono text-muted-foreground">Threshold</span>
+          <span className="text-[10px] font-mono text-muted-foreground">{snapshotMode ? 'Saliency threshold' : 'Threshold'}</span>
           <span className="text-[10px] font-mono text-foreground">{threshold}</span>
         </div>
         <input
@@ -108,7 +109,7 @@ export default function ControlsPanel(props: ControlsPanelProps) {
       </div>
 
       {/* Heatmap Opacity */}
-      <div className="space-y-1">
+      {!snapshotMode && <div className="space-y-1">
         <div className="flex justify-between">
           <span className="text-[10px] font-mono text-muted-foreground">Heatmap Opacity</span>
           <span className="text-[10px] font-mono text-foreground">{heatmapOpacity}%</span>
@@ -121,7 +122,7 @@ export default function ControlsPanel(props: ControlsPanelProps) {
           onChange={e => onHeatmapOpacityChange(Number(e.target.value))}
           className="w-full h-1 bg-secondary rounded-full appearance-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:cursor-pointer"
         />
-      </div>
+      </div>}
 
       {/* Detection Confidence */}
       <div className="space-y-1">

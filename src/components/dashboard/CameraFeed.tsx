@@ -1,6 +1,6 @@
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState } from 'react';
 import type { CameraState, SaliencyMode, DetectedObject } from '@/types/dashboard';
-import { computeSaliency, applyHeatmapColor, computeSaliencyScore } from '@/lib/saliency';
+import { computeSaliency, computeSaliencyScore } from '@/lib/saliency';
 import { RateLimiter, LatestOnlyRunner, ThrottledPublisher, perfMonitor, now as perfNow } from '@/lib/performance';
 
 
@@ -29,6 +29,9 @@ interface CameraFeedProps {
   onFrameCapture?: (canvas: HTMLCanvasElement) => void;
   onDetectFrame?: (video: HTMLVideoElement) => Promise<DetectedObject[]>;
   noSignalMessage?: string;
+  /** Keep detection running without rendering a live dashboard preview. */
+  processingOnly?: boolean;
+  analysisEnabled?: boolean;
 }
 
 export default function CameraFeed({
@@ -48,6 +51,8 @@ export default function CameraFeed({
   onFrameCapture,
   onDetectFrame,
   noSignalMessage,
+  processingOnly = false,
+  analysisEnabled = true,
 }: CameraFeedProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -80,7 +85,7 @@ export default function CameraFeed({
   }, [camera.stream, camera.label]);
 
   // Single render/analysis loop.
-  //  - display: every animation frame (smooth video)
+  //  - display: every animation frame; hidden processing uses the saliency rate
   //  - saliency: throttled to the saliency target rate
   //  - object detection: throttled, latest-frame-only (no backlog)
   //  - React updates: coalesced through throttled publishers
@@ -94,7 +99,10 @@ export default function CameraFeed({
     if (!ctx) return;
 
     let running = true;
+    let processingTimer: number | undefined;
     const cameraId = camera.id;
+    fpsCountRef.current = 0;
+    fpsTimeRef.current = perfNow();
 
     const saliencyLimiter = new RateLimiter(perfMonitor.rateFor('saliency'));
     const objectLimiter = new RateLimiter(perfMonitor.rateFor('object'));
@@ -109,8 +117,17 @@ export default function CameraFeed({
     // Object detection consumes the newest frame only; if a detection is still
     // running when the next slot comes up, the stale frame is dropped.
     const detectRunner = new LatestOnlyRunner<HTMLVideoElement, DetectedObject[]>(
-      async src => (await cbRef.current.onDetectFrame?.(src)) ?? [],
+      async src => {
+        const objects = (await cbRef.current.onDetectFrame?.(src)) ?? [];
+        const scaleX = canvas.width / (src.videoWidth || canvas.width);
+        const scaleY = canvas.height / (src.videoHeight || canvas.height);
+        return objects.map(object => ({ ...object, bbox: [
+          object.bbox[0] * scaleX, object.bbox[1] * scaleY,
+          object.bbox[2] * scaleX, object.bbox[3] * scaleY,
+        ] as [number, number, number, number] }));
+      },
       (objs, latency) => {
+        if (!running) return;
         detectedObjectsRef.current = objs;
         objectsPublisher.push(objs);
         perfMonitor.markAiFrame(latency);
@@ -128,7 +145,7 @@ export default function CameraFeed({
       const t = perfNow();
       const { mirror: mirrored, saliencyMode: mode, threshold: thr } = cbRef.current;
 
-      // --- Display: draw video frame or simulation every rAF tick ---
+      // Draw only at the analysis rate when this is a hidden source.
       if (video && video.readyState >= 2) {
         ctx.save();
         if (mirrored) {
@@ -162,7 +179,7 @@ export default function CameraFeed({
 
       // --- Saliency: throttled, shares this already-drawn canvas ---
       saliencyLimiter.setFps(perfMonitor.rateFor('saliency'));
-      if (saliencyLimiter.shouldRun(t)) {
+      if (analysisEnabled && saliencyLimiter.shouldRun(t)) {
         try {
           const started = perfNow();
           const frameData = ctx.getImageData(0, 0, w, h);
@@ -170,11 +187,11 @@ export default function CameraFeed({
           prevFrameRef.current = frameData;
           saliencyPublisher.push(computeSaliencyScore(saliencyData));
           perfMonitor.markAiFrame(perfNow() - started);
-        } catch {}
+        } catch { /* Keep live monitoring available when frame reads are blocked. */ }
       }
 
       // --- Object detection: throttled + latest-frame-only ---
-      if (!simulationMode && video && cbRef.current.onDetectFrame) {
+      if (analysisEnabled && !simulationMode && video && cbRef.current.onDetectFrame) {
         objectLimiter.setFps(perfMonitor.rateFor('object'));
         if (video.readyState >= 2 && objectLimiter.shouldRun(t)) {
           detectRunner.submit(video);
@@ -193,7 +210,7 @@ export default function CameraFeed({
       }
 
       // Simulation mode: still report objects for other panels (throttled)
-      if (simulationMode && simObjects.length > 0) {
+      if (analysisEnabled && simulationMode && simObjects.length > 0) {
         objectsPublisher.push(simObjects);
       }
 
@@ -205,7 +222,11 @@ export default function CameraFeed({
         fpsTimeRef.current = t;
       }
 
-      animRef.current = requestAnimationFrame(render);
+      if (processingOnly) {
+        processingTimer = window.setTimeout(render, analysisEnabled ? Math.ceil(1000 / perfMonitor.rateFor('saliency')) : 3000);
+      } else {
+        animRef.current = requestAnimationFrame(render);
+      }
     };
 
     render();
@@ -213,13 +234,22 @@ export default function CameraFeed({
     return () => {
       running = false;
       cancelAnimationFrame(animRef.current);
+      if (processingTimer !== undefined) window.clearTimeout(processingTimer);
       detectRunner.cancelPending();
       saliencyPublisher.dispose();
       objectsPublisher.dispose();
       prevFrameRef.current = null;
     };
-  }, [camera.active, camera.id, simulationMode, simObjects]);
+  }, [camera.active, camera.id, simulationMode, simObjects, processingOnly, analysisEnabled]);
 
+  if (processingOnly) {
+    return (
+      <div className="hidden" aria-hidden="true">
+        <video ref={videoRef} autoPlay playsInline muted />
+        <canvas ref={canvasRef} width={camera.active ? 640 : 320} height={camera.active ? 480 : 240} />
+      </div>
+    );
+  }
 
   return (
     <div className="relative bg-card rounded-md overflow-hidden border border-border panel-glow group">

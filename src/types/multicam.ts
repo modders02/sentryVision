@@ -16,6 +16,8 @@ export interface CameraConfig {
   rtspUrl: string;
   /** HLS URL returned by the backend (authoritative). */
   streamUrl?: string;
+  /** WHEP endpoint reported by the bridge for realtime playback. */
+  webrtcUrl?: string;
   enabled: boolean;
   /** AI detection on/off for this camera (independent pipeline). */
   aiEnabled: boolean;
@@ -26,8 +28,12 @@ export interface CameraConfig {
 export interface MultiCamSettings {
   mediamtxHost: string;   // e.g. http://127.0.0.1:8888
   pythonServer: string;   // e.g. http://127.0.0.1:5000
+  webrtcHost?: string;    // optional override for a custom WebRTC listener
   fireThreshold: number;      // 0..1
   objectThreshold: number;    // 0..1
+  saliencyThreshold?: number; // image edge threshold, default 40
+  /** Limit object history to these labels; people are always included. */
+  priorityObjects?: string[];
   audioThreshold: number;     // 0..1
   maxCameras: number;
   gridLayout: GridLayout;
@@ -66,10 +72,15 @@ export interface CameraRuntime {
   error: string | null;
   fps: number;
   latencyMs: number;
+  transport?: 'webrtc' | 'hls' | 'local';
+  playbackWarning?: string | null;
   saliencyScore: number;
   /** Per-camera multimodal score: visual saliency + objects + CCTV audio distress. */
   attentionScore: number;
   objects: DetectedObject[];
+  /** Coordinate system used for detection boxes. */
+  frameWidth?: number;
+  frameHeight?: number;
   humanCount: number;
   fire: { detected: boolean; confidence: number; bbox?: [number, number, number, number] };
   smoke: { detected: boolean; confidence: number };
@@ -108,4 +119,14 @@ export function hlsUrlFor(camera: CameraConfig, settings: MultiCamSettings) {
   if (camera.streamUrl?.trim()) return camera.streamUrl.trim();
   const host = settings.mediamtxHost.trim().replace(/\/+$/, '');
   return `${host}/${camera.path.replace(/^\/+|\/+$/g, '')}/index.m3u8`;
+}
+
+export function webrtcUrlFor(camera: CameraConfig, settings: MultiCamSettings) {
+  if (camera.webrtcUrl?.trim()) return camera.webrtcUrl.trim();
+  if (settings.webrtcHost?.trim()) return `${settings.webrtcHost.replace(/\/+$/, '')}/${camera.path.replace(/^\/+|\/+$/g, '')}/whep`;
+  const url = new URL(hlsUrlFor(camera, settings));
+  url.port = '8889';
+  url.pathname = `/${camera.path.replace(/^\/+|\/+$/g, '')}/whep`;
+  url.search = '';
+  return url.href;
 }

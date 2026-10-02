@@ -17,7 +17,9 @@ from typing import List, Optional
 
 from .binaries import (MissingExecutable, install_hint, need_exe, no_window_flags,
                        now_iso, resolve_exe)
-from .config import AUDIO_CHUNK_SECONDS, HLS_PORT, HLS_PROBE_TTL, RTSP_PORT, match_distress
+from .config import (AUDIO_CHUNK_SECONDS, HLS_PORT, HLS_PROBE_TTL, RTSP_PORT,
+                     VIDEO_FPS, VIDEO_GOP, VIDEO_MAX_WIDTH, VIDEO_THREADS,
+                     WEBRTC_PORT, match_distress)
 from .whisper_engine import WHISPER
 
 NO_AUDIO_MESSAGE = (
@@ -93,7 +95,7 @@ class Camera:
     _hls_ok: bool = False
     _hls_checked: float = 0.0
 
-    # ---- video: RTSP -> MediaMTX (copy, low CPU) --------------------------- #
+    # ---- video: RTSP -> MediaMTX (browser-compatible, low delay) ---------- #
     def _capture_video_errors(self, proc: subprocess.Popen):
         if not proc.stderr:
             return
@@ -111,31 +113,51 @@ class Camera:
         with self.lock:
             return self.stderr_lines[-1] if self.stderr_lines else "RTSP stream ended"
 
+    def _video_cmd(self, ffmpeg: str) -> List[str]:
+        """Remove codec reorder/lookahead queues before WebRTC delivery.
+
+        Copying arbitrary CCTV video preserves H265 and H264 B-frames, which
+        browsers cannot reliably read over WebRTC. Opus keeps sound usable in
+        WebRTC and low-latency HLS; transcription independently decodes 16 kHz
+        PCM from the same local restream.
+        """
+        return [
+            ffmpeg,
+            "-nostdin", "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+genpts+discardcorrupt+nobuffer",
+            "-flags", "low_delay", "-threads", "1",
+            "-analyzeduration", "1000000", "-probesize", "262144",
+            "-max_delay", "0", "-reorder_queue_size", "0",
+            "-rtsp_transport", "tcp",
+            "-i", self.rtsp,
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-vf", (f"scale=w='trunc(min({VIDEO_MAX_WIDTH},iw)/2)*2':h=-2:"
+                    f"flags=fast_bilinear,fps={VIDEO_FPS}"),
+            "-filter_threads", "1",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-profile:v", "baseline", "-pix_fmt", "yuv420p", "-crf", "23",
+            "-bf", "0", "-g", str(VIDEO_GOP), "-keyint_min", str(VIDEO_GOP),
+            "-sc_threshold", "0", "-threads:v", str(VIDEO_THREADS),
+            "-c:a", "libopus", "-ar", "48000", "-ac", "1", "-b:a", "64k",
+            "-application", "lowdelay", "-frame_duration", "20",
+            "-max_interleave_delta", "100000", "-flush_packets", "1",
+            "-muxdelay", "0", "-muxpreload", "0", "-rtsp_transport", "tcp",
+            "-f", "rtsp",
+            f"rtsp://127.0.0.1:{RTSP_PORT}/{self.path}",
+        ]
+
     def start_video(self):
         if self.video_proc and self.video_proc.poll() is None:
             return
 
         ffmpeg = need_exe("ffmpeg", "FFMPEG_EXE")
-        cmd = [
-            ffmpeg,
-            "-nostdin", "-hide_banner", "-loglevel", "warning",
-            "-fflags", "+genpts+discardcorrupt",
-            "-rtsp_transport", "tcp",
-            "-i", self.rtsp,
-            "-map", "0:v:0", "-map", "0:a:0?",
-            "-c:v", "copy",
-            "-c:a", "aac", "-ar", "16000", "-ac", "1",
-            "-f", "rtsp",
-            f"rtsp://127.0.0.1:{RTSP_PORT}/{self.path}",
-        ]
-
         with self.lock:
             self.stderr_lines = []
         self.error = None
         self.started_at = time.time()
 
         self.video_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            self._video_cmd(ffmpeg), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             creationflags=no_window_flags(),
         )
         threading.Thread(target=self._capture_video_errors,
@@ -668,6 +690,8 @@ class Camera:
             "hls_ready": self.hls_ready(),
             "stream": f"http://{host}:{HLS_PORT}/{self.path}/index.m3u8",
             "stream_local": f"http://127.0.0.1:{HLS_PORT}/{self.path}/index.m3u8",
+            "webrtc": f"http://{host}:{WEBRTC_PORT}/{self.path}/whep",
+            "webrtc_local": f"http://127.0.0.1:{WEBRTC_PORT}/{self.path}/whep",
             "restarts": self.restarts,
             "error": self.error,
             "audio": self.audio_status(),

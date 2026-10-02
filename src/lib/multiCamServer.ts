@@ -9,6 +9,8 @@ export interface BackendCameraStatus {
   hls_ready: boolean;
   stream: string;
   stream_local: string;
+  webrtc?: string;
+  webrtc_local?: string;
   restarts: number;
   error: string | null;
   audio?: CctvAudioStatus;
@@ -140,6 +142,51 @@ const json = (body: unknown): RequestInit => ({
 
 export const getMultiStatus = (server: string) =>
   req<BackendStatus>(`${base(server)}/status`, undefined, 6000);
+
+/** Fetch a still JPEG without opening a video player or decoding a live feed. */
+export async function getCameraSnapshot(
+  server: string,
+  id: string,
+  signal?: AbortSignal,
+): Promise<{ blob: Blob; timestamp: number }> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) controller.abort();
+  const timeout = setTimeout(abort, 8000);
+  try {
+    const response = await fetch(`${base(server)}/cameras/${encodeURIComponent(id)}/snapshot`, {
+      signal: controller.signal,
+      mode: 'cors',
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      if (response.status === 404) {
+        let missingSnapshotRoute = false;
+        try {
+          const body = await response.json();
+          missingSnapshotRoute = body?.detail === 'Not Found';
+        } catch { /* An unreachable camera can also return a non-JSON error. */ }
+        if (missingSnapshotRoute) {
+          throw new Error('Restart the local camera service to enable camera snapshots');
+        }
+      }
+      throw new Error(`Camera snapshot unavailable (HTTP ${response.status})`);
+    }
+    const blob = await response.blob();
+    if (!blob.size || !blob.type.startsWith('image/jpeg')) {
+      throw new Error('The camera service did not return a JPEG snapshot');
+    }
+    const capturedAt = Number(response.headers.get('X-Snapshot-Timestamp'));
+    return {
+      blob,
+      timestamp: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : Date.now(),
+    };
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener('abort', abort);
+  }
+}
 
 /** Push the locally-stored camera list to the Python backend. */
 export const syncCameras = (server: string, cameras: CameraConfig[]) =>

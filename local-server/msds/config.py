@@ -13,6 +13,14 @@ IS_WINDOWS = os.name == "nt"
 API_PORT = int(os.environ.get("MSD_API_PORT", 5000))
 HLS_PORT = int(os.environ.get("MSD_HLS_PORT", 8888))
 RTSP_PORT = int(os.environ.get("MSD_RTSP_PORT", 8554))
+WEBRTC_PORT = int(os.environ.get("MSD_WEBRTC_PORT", 8889))
+
+# Normalize CCTV video for browser WebRTC: bounded CPU, no B-frames, and an
+# IDR every half-second. Source-camera and network delay still apply.
+VIDEO_FPS = max(5, min(30, int(os.environ.get("MSD_VIDEO_FPS", 20))))
+VIDEO_MAX_WIDTH = max(320, min(1920, int(os.environ.get("MSD_VIDEO_MAX_WIDTH", 1280))))
+VIDEO_THREADS = max(1, min(4, int(os.environ.get("MSD_VIDEO_THREADS", 2))))
+VIDEO_GOP = max(1, VIDEO_FPS // 2)
 
 MAX_CAMERAS = 16
 # Length of each WAV segment fed to Whisper. Shorter = more responsive UI.

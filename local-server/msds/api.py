@@ -5,14 +5,18 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
-from .binaries import install_hint, lan_ip, pip_install_command, resolve_exe
-from .config import HLS_PORT, WHISPER_MODEL
+from .binaries import (install_hint, lan_ip, no_window_flags, pip_install_command,
+                       resolve_exe)
+from .config import HLS_PORT, RTSP_PORT, WHISPER_MODEL
 from .manager import (CAMERAS, mediamtx_running, snapshot, start_mediamtx,
                       stop_all_cameras, sync_cameras)
 from .whisper_engine import WHISPER
@@ -20,7 +24,44 @@ from .whisper_engine import WHISPER
 app = FastAPI(title="MSDSystem multi-camera bridge")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    expose_headers=["X-Snapshot-Timestamp"],
 )
+
+SNAPSHOT_TTL = 3.0
+SNAPSHOT_TIMEOUT = 6.0
+
+
+@dataclass
+class _CameraSnapshot:
+    generation: tuple
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    captured_at: float = 0.0
+    timestamp: int = 0
+    image: Optional[bytes] = None
+    error: Optional[tuple[int, str]] = None
+
+
+_SNAPSHOTS: dict[str, _CameraSnapshot] = {}
+_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _snapshot_generation(cam) -> tuple:
+    # Invalidate an old picture when a slot is reconfigured or restarted.
+    return (id(cam), cam.path, cam.rtsp, cam.started_at)
+
+
+def _snapshot_state(cam) -> _CameraSnapshot:
+    generation = _snapshot_generation(cam)
+    registered = {camera.id for camera in snapshot()}
+    with _SNAPSHOT_LOCK:
+        for camera_id in list(_SNAPSHOTS):
+            if camera_id not in registered:
+                del _SNAPSHOTS[camera_id]
+        state = _SNAPSHOTS.get(cam.id)
+        if state is None or state.generation != generation:
+            state = _CameraSnapshot(generation)
+            _SNAPSHOTS[cam.id] = state
+        return state
 
 
 def find_camera(camera_id: str):
@@ -43,6 +84,70 @@ def find_camera(camera_id: str):
             return cam
     return None
 
+
+@app.get("/cameras/{camera_id}/snapshot")
+def camera_snapshot(camera_id: str):
+    """Return one small still from the shared local stream, never a video feed.
+
+    This synchronous route runs in FastAPI's thread pool. Requests for the same
+    camera share a capture and a short cache, rather than decoding concurrently
+    or opening additional RTSP sessions against the CCTV device.
+    """
+    cam = find_camera(camera_id)
+    if cam is None:
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    state = _snapshot_state(cam)
+    with state.lock:
+        if not cam.enabled or not cam.running() or not mediamtx_running():
+            raise HTTPException(status_code=503, detail="Camera is offline or disabled")
+        if state.generation != _snapshot_generation(cam):
+            raise HTTPException(status_code=503, detail="Camera is reconnecting")
+
+        if not state.captured_at or time.monotonic() - state.captured_at >= SNAPSHOT_TTL:
+            state.image = None
+            state.error = None
+            ffmpeg = resolve_exe("ffmpeg", "FFMPEG_EXE")
+            if not ffmpeg:
+                state.error = (503, "FFmpeg is unavailable on the camera service")
+            else:
+                try:
+                    out = subprocess.run(
+                        [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+                         "-rtsp_transport", "tcp", "-timeout", "5000000",
+                         "-threads", "1", "-i",
+                         f"rtsp://127.0.0.1:{RTSP_PORT}/{cam.path}",
+                         "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
+                         "-vf", "scale=w='min(640,iw)':h=-2", "-filter_threads", "1",
+                         "-threads", "1", "-c:v", "mjpeg", "-q:v", "5",
+                         "-f", "image2pipe", "pipe:1"],
+                        capture_output=True, timeout=SNAPSHOT_TIMEOUT,
+                        creationflags=no_window_flags(),
+                    )
+                    if (out.returncode == 0 and out.stdout
+                            and out.stdout.startswith(b"\xff\xd8")
+                            and out.stdout.endswith(b"\xff\xd9")):
+                        state.image = out.stdout
+                        state.timestamp = int(time.time() * 1000)
+                    else:
+                        state.error = (503, "A camera snapshot is not available yet")
+                except subprocess.TimeoutExpired:
+                    state.error = (504, "Timed out capturing a camera snapshot")
+                except (OSError, subprocess.SubprocessError):
+                    state.error = (503, "Could not capture a camera snapshot")
+            # Failures also share the cooldown; concurrent clients cannot queue
+            # repeated FFmpeg attempts against an unreachable stream.
+            state.captured_at = time.monotonic()
+
+        if state.generation != _snapshot_generation(cam) or not cam.enabled or not cam.running():
+            state.image = None
+            raise HTTPException(status_code=503, detail="Camera is reconnecting or offline")
+        if state.error:
+            code, detail = state.error
+            raise HTTPException(status_code=code, detail=detail)
+        return Response(
+            content=state.image, media_type="image/jpeg",
+            headers={"Cache-Control": "no-store", "X-Snapshot-Timestamp": str(state.timestamp)},
+        )
 
 
 @app.get("/status")

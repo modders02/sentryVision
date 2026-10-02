@@ -9,7 +9,6 @@ import Auth from "./pages/Auth";
 import ResetPassword from "./pages/ResetPassword";
 import Household from "./pages/Household";
 import Research from "./pages/Research";
-import Monitoring from "./pages/Monitoring";
 import NotFound from "./pages/NotFound";
 import RequireAuth from "./components/RequireAuth";
 
@@ -23,13 +22,15 @@ const App = () => (
       <HashRouter>
         <Routes>
           <Route path="/" element={<Landing />} />
-          <Route path="/dashboard" element={<RequireAuth><Index /></RequireAuth>} />
+          <Route element={<RequireAuth><Index /></RequireAuth>}>
+            <Route path="/dashboard" element={<></>} />
+            <Route path="/cameras" element={<></>} />
+          </Route>
           <Route path="/auth" element={<Auth />} />
           <Route path="/join/:code" element={<Auth />} />
           <Route path="/reset-password" element={<ResetPassword />} />
           <Route path="/household" element={<RequireAuth><Household /></RequireAuth>} />
-          <Route path="/monitoring" element={<RequireAuth><Monitoring /></RequireAuth>} />
-          <Route path="/cameras" element={<Navigate to="/monitoring" replace />} />
+          <Route path="/monitoring" element={<Navigate to="/cameras" replace />} />
           <Route path="/research" element={<RequireAuth><Research /></RequireAuth>} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
