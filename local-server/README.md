@@ -54,7 +54,8 @@ python camera_server.py
 ## Whisper / CCTV wake words
 
 `faster-whisper` downloads its model on first use (`MSD_WHISPER_MODEL`,
-default `base`; use `tiny` for a smaller download). Video keeps streaming when
+default `small`, a multilingual model; use `base` or `tiny` for a smaller
+download and lower CPU cost). Video keeps streaming when
 audio is unavailable, and `/status` reports which failure mode you hit:
 
 | `whisper_state`   | meaning                                                  |
@@ -62,6 +63,47 @@ audio is unavailable, and `/status` reports which failure mode you hit:
 | `package_missing` | faster-whisper is not installed in the running Python.    |
 | `model_error`     | package present, but the model failed to download/load.   |
 | `ready`           | transcription is running.                                 |
+
+The bridge publishes only finalized original-language transcription. It
+decodes each independent phrase after 600 ms of quiet or a six-second maximum
+context window, without interim captions or translation. Capture runs
+independently of inference, with at most four phrases queued. The bounded queue
+reports skipped phrases in `dropped_caption_jobs` if the machine cannot keep
+up. Rejected noise clears the current transcript without adding an event.
+
+Final decoding starts with a five-beam search and retries repetitive or weak
+output at modest temperatures. Silero voice detection, word timestamps,
+silence-aware hallucination rejection, and acoustic-confidence checks reduce
+phantom text. A highly compressed result with at least twelve words at more
+than eight words per second is rejected as a decoder loop. Credible spoken
+repetitions and ordinary phrases are retained, without distress-word prompts
+or rewriting the speaker's words.
+
+Background noise, accents, overlapping speakers, camera/network delay, and
+CPU load still affect accuracy and latency; 100% transcription accuracy cannot
+be guaranteed. The larger default model needs more memory and initialization
+time than `base`. Check recognition using recordings from the actual camera.
+
+Tune `MSD_AUDIO_SILENCE_SECONDS` (default `0.6`, range `0.2`–`1`) and
+`MSD_AUDIO_CHUNK_SECONDS` (maximum final context, default `6`, range `1`–`15`).
+`MSD_AUDIO_MIN_RMS` (default `0.001`) only gates very quiet PCM before Whisper
+VAD; decrease it for a quiet camera microphone. `MSD_WHISPER_LANGUAGE` is unset
+by default for multilingual English/Tagalog detection; set `en` or `tl` only
+when that microphone uses one language. `MSD_WHISPER_CPU_THREADS` defaults to
+`4`. GPU-equipped systems may set `MSD_WHISPER_DEVICE=cuda` and
+`MSD_WHISPER_COMPUTE_TYPE=float16` when their faster-whisper CUDA runtime is
+installed. Larger multilingual models can improve recognition at the cost of
+more memory and decode time; benchmark with recordings from the actual camera.
+
+`/cameras/<id>/audio-events` exposes `last_transcript`,
+`last_transcription_at`, `transcription_mode: "final"`,
+`caption_silence_seconds`, and `transcription_latency_ms`. The latter measures
+queue plus inference time since the submitted audio boundary, not camera or
+network delay. Legacy partial fields remain empty and `caption_update_seconds`
+is zero. `MSD_AUDIO_CAPTION_UPDATE_SECONDS` no longer schedules drafts.
+Restart the local camera service after changing these settings.
+The decode parameters and direct PCM input follow the official
+[faster-whisper transcription implementation](https://github.com/SYSTRAN/faster-whisper/blob/master/faster_whisper/transcribe.py).
 
 ## Environment variables
 

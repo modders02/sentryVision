@@ -41,6 +41,12 @@ interface MsdsBridge {
   getEnv(): Promise<MsdsDesktopEnv>;
   getLocalServerStatus(): Promise<LocalServerStatus>;
   openExternal(url: string): Promise<void>;
+  /** Invoked only by the user's explicit recording settings action. */
+  chooseClipFolder(): Promise<string | null>;
+  getClipFolder(): Promise<string | null>;
+  forgetClipFolder(): Promise<void>;
+  /** Writes only inside the selected folder, without presenting any dialog. */
+  saveClip(data: ArrayBuffer, filename: string): Promise<string>;
 }
 
 declare global {

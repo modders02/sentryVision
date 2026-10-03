@@ -6,6 +6,8 @@
  */
 
 let cachedVoice: SpeechSynthesisVoice | null = null;
+let queuedSentences = 0;
+let speechGeneration = 0;
 
 /** Preference order — the smoothest female voices across browsers/platforms. */
 const FEMALE_HINTS = [
@@ -40,7 +42,7 @@ export function pickVoice(): SpeechSynthesisVoice | null {
 }
 
 if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-  window.speechSynthesis.onvoiceschanged = () => { cachedVoice = null; pickVoice(); };
+  window.speechSynthesis.addEventListener('voiceschanged', () => { cachedVoice = null; pickVoice(); });
   pickVoice();
 }
 
@@ -58,7 +60,12 @@ export function speak(text: string, opts: SpeakOptions = {}) {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     const clean = text.replace(/\s+/g, ' ').trim();
     if (!clean) return;
-    if (opts.interrupt !== false) window.speechSynthesis.cancel();
+    if (opts.interrupt !== false) {
+      stopSpeaking();
+    } else if (queuedSentences >= 4) {
+      // Frequent monitoring updates must not build minutes of stale narration.
+      return;
+    }
     const u = new SpeechSynthesisUtterance(clean);
     // Slightly slower + warmer than the default for seniors and low-vision users.
     u.rate = opts.rate ?? 0.94;
@@ -66,10 +73,24 @@ export function speak(text: string, opts: SpeakOptions = {}) {
     u.volume = opts.volume ?? 1;
     const voice = pickVoice();
     if (voice) { u.voice = voice; u.lang = voice.lang; }
+    const generation = speechGeneration;
+    queuedSentences++;
+    let finished = false;
+    const finish = () => {
+      if (finished || generation !== speechGeneration) return;
+      finished = true;
+      queuedSentences = Math.max(0, queuedSentences - 1);
+    };
+    u.onend = finish;
+    u.onerror = finish;
     window.speechSynthesis.speak(u);
   } catch { /* speech is best-effort */ }
 }
 
 export function stopSpeaking() {
-  try { window.speechSynthesis?.cancel(); } catch { /* noop */ }
+  speechGeneration++;
+  queuedSentences = 0;
+  try {
+    if (typeof window !== 'undefined') window.speechSynthesis?.cancel();
+  } catch { /* noop */ }
 }

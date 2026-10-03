@@ -1,7 +1,8 @@
-import { Bell, BellOff, Camera, ChevronRight, Ellipsis, Mic, Play, Settings2, ShieldCheck, Wifi, WifiOff } from 'lucide-react';
+import { Bell, BellOff, Camera, ChevronRight, Ellipsis, Play, Settings2, ShieldCheck, Wifi, WifiOff } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useCameraSession } from '@/lib/cameraSessions';
 import type { CameraSlot } from '@/hooks/useCameraSlots';
+import TranscriptionBox from '@/components/multicam/TranscriptionBox';
 
 interface Props {
   slot: CameraSlot;
@@ -22,7 +23,7 @@ export default function DashboardCameraCard({ slot, monitoring, eventCount, onCo
   const openCamera = () => configured ? navigate(`/cameras?camera=slot-${slot.index}`) : onConnect(slot.index);
 
   return (
-    <article className="relative overflow-hidden rounded-2xl border border-white/10 bg-[#151e24] p-3 text-white shadow-sm sm:p-4">
+    <article className="relative min-w-0 overflow-hidden rounded-2xl border border-white/10 bg-[#151e24] p-3 text-white shadow-sm sm:p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <button onClick={openCamera} className="min-w-0 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400">
           <h3 className="truncate text-xl font-semibold tracking-tight">{slot.name || `Camera ${slot.index}`}</h3>
@@ -80,9 +81,8 @@ export default function DashboardCameraCard({ slot, monitoring, eventCount, onCo
           <ChevronRight className="hidden h-5 w-5 shrink-0 sm:block" />
         </button>
       </div>
-      <div id={slot.index === 1 ? 'tour-live-transcription' : undefined} className="mt-3 flex items-start gap-2 rounded-lg bg-black/20 px-3 py-2 text-sm text-slate-300">
-        <Mic className={`mt-0.5 h-4 w-4 shrink-0 ${session.runtime?.audioListening ? 'text-cyan-400' : 'text-slate-500'}`} />
-        <p aria-live="polite" className="min-w-0 break-words">{transcript || session.runtime?.transcript || session.runtime?.audioMessage || 'Connect this camera to start listening.'}</p>
+      <div className="mt-3">
+        <TranscriptionBox id={slot.index === 1 ? 'tour-live-transcription' : undefined} cameraName={slot.name || `Camera ${slot.index}`} transcript={transcript ?? session.runtime?.transcript} listening={session.runtime?.audioListening} message={session.runtime?.audioMessage || (!configured ? 'Connect this camera to start listening.' : undefined)} tone={session.runtime?.audioTone} appearance="dark" />
       </div>
     </article>
   );

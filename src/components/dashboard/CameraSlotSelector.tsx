@@ -5,6 +5,7 @@ import { useCctvTalk } from '@/hooks/useCctvTalk';
 import { slotCamera, slotSettings, type CameraSlot } from '@/hooks/useCameraSlots';
 import { testCameraAudio } from '@/lib/multiCamServer';
 import { Button } from '@/components/ui/button';
+import TranscriptionBox from '@/components/multicam/TranscriptionBox';
 import type { CameraRuntime, DetectionEvent } from '@/types/multicam';
 
 
@@ -151,155 +152,146 @@ export function SlotPipelineView({
       aria-hidden={!visible}
       className={
         visible
-          ? 'relative bg-card rounded-md overflow-hidden border border-border panel-glow'
+          ? 'relative min-w-0 bg-card rounded-md overflow-hidden border border-border panel-glow'
           : 'absolute -left-[9999px] top-0 w-[320px] pointer-events-none opacity-0'
       }
     >
-      <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between px-2 py-1 bg-gradient-to-b from-background/80 to-transparent">
-        <span className="text-[12px] font-semibold text-primary uppercase tracking-wider">
-          CAM {slot.index} — {slot.name || 'Camera'}
-        </span>
-        <span className="flex items-center gap-2">
-          <span className="text-[11px] text-muted-foreground">{runtime.fps} fps</span>
-          <span className={`w-2 h-2 rounded-full ${runtime.status === 'online' ? 'bg-success' : connected ? 'bg-warning' : 'bg-destructive'}`} />
-        </span>
+      <div className="relative">
+        <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between px-2 py-1 bg-gradient-to-b from-background/80 to-transparent">
+          <span className="text-[12px] font-semibold text-primary uppercase tracking-wider">
+            CAM {slot.index} — {slot.name || 'Camera'}
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="text-[11px] text-muted-foreground">{runtime.fps} fps</span>
+            <span className={`w-2 h-2 rounded-full ${runtime.status === 'online' ? 'bg-success' : connected ? 'bg-warning' : 'bg-destructive'}`} />
+          </span>
+        </div>
+
+        <video
+          ref={videoRef}
+          muted={!speaker}
+          playsInline
+          autoPlay
+          className="w-full aspect-video object-contain bg-background"
+        />
+
+        {connected && (
+          <div className="absolute bottom-0 left-0 right-0 z-10 flex flex-wrap items-center gap-1.5 px-2 py-1.5 bg-gradient-to-t from-background/90 to-transparent">
+            {badge(runtime.fire.detected, Flame, `Fire ${Math.round(runtime.fire.confidence * 100)}%`)}
+            {badge(runtime.humanCount > 0, Users, `${runtime.humanCount} person`)}
+            {badge(runtime.faceDistress.detected, Smile, 'Face distress')}
+            {badge(runtime.audioDistress.detected, Mic, runtime.audioDistress.keyword || 'Audio')}
+            <span className="flex items-center gap-1 rounded bg-secondary/70 px-1.5 py-0.5 text-[11px] font-semibold text-foreground">
+              <Gauge className="h-3 w-3" /> Attention {runtime.attentionScore}
+            </span>
+            <span className="text-[11px] font-semibold text-muted-foreground">Saliency {runtime.saliencyScore}</span>
+            <div className="ml-auto flex items-center gap-1">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 bg-background/80"
+                onClick={() => setSpeaker(value => !value)}
+                aria-label={speaker ? `Mute CAM ${slot.index}` : `Hear CAM ${slot.index}`}
+                title={speaker ? 'Mute camera sound' : 'Hear camera sound'}
+              >
+                {speaker ? <Volume2 className="h-4 w-4 text-primary" /> : <VolumeX className="h-4 w-4" />}
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 bg-background/80"
+                onMouseDown={talk.startTalk}
+                onMouseUp={talk.stopTalk}
+                onMouseLeave={talk.stopTalk}
+                onTouchStart={talk.startTalk}
+                onTouchEnd={talk.stopTalk}
+                aria-label={`Hold to talk through CAM ${slot.index}`}
+                title="Hold to talk through this camera"
+              >
+                {talk.talking ? <Mic className="h-4 w-4 text-destructive" /> : <MicOff className="h-4 w-4" />}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {connected && (runtime.fire.detected || runtime.smoke.detected || runtime.faceDistress.detected || runtime.audioDistress.detected || runtime.attentionScore > 70) && (
+          <div className="absolute right-2 top-8 z-10 flex max-w-[42%] items-start gap-1.5 rounded-md border border-destructive/40 bg-destructive/90 px-2 py-1.5 text-[12px] font-semibold text-destructive-foreground">
+            <BellRing className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              {runtime.fire.detected ? 'Fire detected' : runtime.smoke.detected ? 'Smoke detected' : runtime.audioDistress.detected ? `Safety word: ${runtime.audioDistress.keyword}` : runtime.faceDistress.detected ? 'Facial distress detected' : `High attention: ${runtime.attentionScore}`}
+            </span>
+          </div>
+        )}
+
+        {talk.error && (
+          <div className="absolute bottom-12 right-2 z-10 max-w-[70%] rounded border border-destructive/40 bg-background/95 px-2 py-1 text-[11px] text-destructive">
+            {talk.error}
+          </div>
+        )}
+
+        {!connected && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-background/85 text-center px-4">
+            <VideoOff className="w-7 h-7 text-muted-foreground" />
+            <span className="text-[14px] font-semibold text-muted-foreground">Not connected</span>
+            <span className="text-[13px] text-muted-foreground">
+              Open Connect and add an IP address for CAM {slot.index}.
+            </span>
+          </div>
+        )}
       </div>
-
-      <video
-        ref={videoRef}
-        muted={!speaker}
-        playsInline
-        autoPlay
-        className="w-full aspect-video object-contain bg-background"
-      />
-
-      {/* Live transcription of what this camera hears + why it is silent */}
       {connected && (
-        <div className="absolute top-8 left-2 z-10 max-w-[70%] rounded-md bg-background/85 border border-border px-2.5 py-1.5">
-          <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-primary">
-            <Mic className="w-3 h-3" /> Live transcription
-          </div>
-          <p aria-live="polite" className="mt-0.5 max-h-24 overflow-y-auto text-[13px] leading-snug text-foreground">
-            {runtime.transcript || (
-              <span className={runtime.audioTone === 'error' ? 'text-destructive' : 'text-muted-foreground'}>
-                {runtime.audioMessage}
-              </span>
-            )}
-          </p>
-          {runtime.transcript && runtime.audioTone === 'error' && (
-            <p className="mt-0.5 text-[11px] leading-snug text-destructive">{runtime.audioMessage}</p>
-          )}
-          <p className="mt-1 text-[10px] font-mono text-muted-foreground">
-            {runtime.audio?.thread_running ? 'worker on' : 'worker off'}
-            {' · '}{runtime.audio?.connected ? 'audio in' : 'no audio'}
-            {runtime.audio?.audio_source ? ` · via ${runtime.audio.audio_source}` : ''}
-            {' · '}{runtime.audio?.chunks_received ?? 0} chunks
-            {' · '}{runtime.audio?.whisper_state ?? (runtime.audioBackendReachable ? '—' : 'offline')}
-            {runtime.audio?.last_transcription_at
-              ? ` · ${new Date(runtime.audio.last_transcription_at).toLocaleTimeString()}`
-              : ''}
-          </p>
-          {runtime.audio?.ffmpeg_error && (
-            <p className="mt-0.5 max-h-8 overflow-hidden text-[10px] font-mono text-muted-foreground">
-              {runtime.audio.ffmpeg_error}
-            </p>
-          )}
-          <button
-            type="button"
-            onClick={async () => {
-              setTesting(true); setTestResult('Testing the camera sound…');
-              try {
-                const r = await testCameraAudio(settings.pythonServer, camera.id);
-                setTestResult(
-                  r.success
-                    ? `Sound OK via ${r.source ?? 'camera'} — heard: "${r.transcript || '(silence)'}"`
-                    : `No sound: ${r.error ?? 'unknown problem'}`,
-                );
-              } catch (err) {
-                setTestResult(err instanceof Error ? err.message : String(err));
-              } finally {
-                setTesting(false);
-              }
-            }}
-            disabled={testing}
-            className="mt-1 rounded border border-border px-2 py-0.5 text-[11px] font-semibold text-foreground hover:bg-secondary/50 disabled:opacity-60"
-          >
-            {testing ? 'Testing…' : 'Test camera sound'}
-          </button>
-          {testResult && (
-            <p className="mt-0.5 max-h-10 overflow-hidden text-[10px] leading-snug text-muted-foreground">
-              {testResult}
-            </p>
-          )}
-        </div>
-      )}
-
-
-
-      {connected && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex flex-wrap items-center gap-1.5 px-2 py-1.5 bg-gradient-to-t from-background/90 to-transparent">
-          {badge(runtime.fire.detected, Flame, `Fire ${Math.round(runtime.fire.confidence * 100)}%`)}
-          {badge(runtime.humanCount > 0, Users, `${runtime.humanCount} person`)}
-          {badge(runtime.faceDistress.detected, Smile, 'Face distress')}
-          {badge(runtime.audioDistress.detected, Mic, runtime.audioDistress.keyword || 'Audio')}
-          <span className="flex items-center gap-1 rounded bg-secondary/70 px-1.5 py-0.5 text-[11px] font-semibold text-foreground">
-            <Gauge className="h-3 w-3" /> Attention {runtime.attentionScore}
-          </span>
-          <span className="text-[11px] font-semibold text-muted-foreground">Saliency {runtime.saliencyScore}</span>
-          <div className="ml-auto flex items-center gap-1">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 bg-background/80"
-              onClick={() => setSpeaker(value => !value)}
-              aria-label={speaker ? `Mute CAM ${slot.index}` : `Hear CAM ${slot.index}`}
-              title={speaker ? 'Mute camera sound' : 'Hear camera sound'}
-            >
-              {speaker ? <Volume2 className="h-4 w-4 text-primary" /> : <VolumeX className="h-4 w-4" />}
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 bg-background/80"
-              onMouseDown={talk.startTalk}
-              onMouseUp={talk.stopTalk}
-              onMouseLeave={talk.stopTalk}
-              onTouchStart={talk.startTalk}
-              onTouchEnd={talk.stopTalk}
-              aria-label={`Hold to talk through CAM ${slot.index}`}
-              title="Hold to talk through this camera"
-            >
-              {talk.talking ? <Mic className="h-4 w-4 text-destructive" /> : <MicOff className="h-4 w-4" />}
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {connected && (runtime.fire.detected || runtime.smoke.detected || runtime.faceDistress.detected || runtime.audioDistress.detected || runtime.attentionScore > 70) && (
-        <div className="absolute right-2 top-8 z-10 flex max-w-[42%] items-start gap-1.5 rounded-md border border-destructive/40 bg-destructive/90 px-2 py-1.5 text-[12px] font-semibold text-destructive-foreground">
-          <BellRing className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span>
-            {runtime.fire.detected ? 'Fire detected' : runtime.smoke.detected ? 'Smoke detected' : runtime.audioDistress.detected ? `Safety word: ${runtime.audioDistress.keyword}` : runtime.faceDistress.detected ? 'Facial distress detected' : `High attention: ${runtime.attentionScore}`}
-          </span>
-        </div>
-      )}
-
-      {talk.error && (
-        <div className="absolute bottom-12 right-2 z-10 max-w-[70%] rounded border border-destructive/40 bg-background/95 px-2 py-1 text-[11px] text-destructive">
-          {talk.error}
-        </div>
-      )}
-
-      {!connected && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-background/85 text-center px-4">
-          <VideoOff className="w-7 h-7 text-muted-foreground" />
-          <span className="text-[14px] font-semibold text-muted-foreground">Not connected</span>
-          <span className="text-[13px] text-muted-foreground">
-            Open Connect and add an IP address for CAM {slot.index}.
-          </span>
-        </div>
+        <>
+          <TranscriptionBox cameraName={slot.name || `Camera ${slot.index}`} transcript={runtime.transcript} listening={runtime.audioListening} message={runtime.audioMessage} tone={runtime.audioTone} />
+          <details className="border-t border-border px-3 py-2 text-xs">
+            <summary className="cursor-pointer font-semibold text-muted-foreground">Camera audio details</summary>
+            <div className="mt-2 max-h-40 overflow-y-auto break-words">
+              <p className="mt-1 text-[10px] font-mono text-muted-foreground">
+                {runtime.audio?.thread_running ? 'worker on' : 'worker off'}
+                {' · '}{runtime.audio?.connected ? 'audio in' : 'no audio'}
+                {runtime.audio?.audio_source ? ` · via ${runtime.audio.audio_source}` : ''}
+                {' · '}{runtime.audio?.chunks_received ?? 0} chunks
+                {' · '}{runtime.audio?.whisper_state ?? (runtime.audioBackendReachable ? '—' : 'offline')}
+                {runtime.audio?.last_transcription_at
+                  ? ` · ${new Date(runtime.audio.last_transcription_at).toLocaleTimeString()}`
+                  : ''}
+              </p>
+              {runtime.audio?.ffmpeg_error && (
+                <p className="mt-0.5 max-h-8 overflow-hidden text-[10px] font-mono text-muted-foreground">
+                  {runtime.audio.ffmpeg_error}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={async () => {
+                  setTesting(true); setTestResult('Testing the camera sound…');
+                  try {
+                    const r = await testCameraAudio(settings.pythonServer, camera.id);
+                    setTestResult(
+                      r.success
+                        ? `Sound OK via ${r.source ?? 'camera'} — heard: "${r.transcript || '(silence)'}"`
+                        : `No sound: ${r.error ?? 'unknown problem'}`,
+                    );
+                  } catch (err) {
+                    setTestResult(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setTesting(false);
+                  }
+                }}
+                disabled={testing}
+                className="mt-1 rounded border border-border px-2 py-0.5 text-[11px] font-semibold text-foreground hover:bg-secondary/50 disabled:opacity-60"
+              >
+                {testing ? 'Testing…' : 'Test camera sound'}
+              </button>
+              {testResult && (
+                <p className="mt-0.5 max-h-10 overflow-hidden text-[10px] leading-snug text-muted-foreground">
+                  {testResult}
+                </p>
+              )}
+            </div>
+          </details>
+        </>
       )}
     </div>
   );

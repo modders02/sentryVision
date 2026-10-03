@@ -4,6 +4,7 @@ import { setVoiceGuide } from '@/lib/voiceGuide';
 const FONT_KEY = 'safewatch-font-scale';
 const HC_KEY = 'safewatch-high-contrast';
 const VOICE_KEY = 'safewatch-voice-guide';
+const NATIVE_READER_KEY = 'safewatch-native-screen-reader';
 
 export const MIN_SCALE = 85;
 export const MAX_SCALE = 160;
@@ -33,6 +34,10 @@ export function readVoiceGuide(): boolean {
   return localStorage.getItem(VOICE_KEY) === 'true';
 }
 
+export function readNativeScreenReader(): boolean {
+  return localStorage.getItem(NATIVE_READER_KEY) === 'true';
+}
+
 /** Applies stored accessibility settings as early as possible. */
 export function initAccessibility() {
   applyFontScale(readFontScale());
@@ -40,7 +45,7 @@ export function initAccessibility() {
   if (readVoiceGuide()) {
     // Browsers block speech before a gesture — arm it on the first interaction.
     const arm = () => {
-      setVoiceGuide(true);
+      if (readVoiceGuide()) setVoiceGuide(true, !readNativeScreenReader());
       window.removeEventListener('pointerdown', arm);
       window.removeEventListener('keydown', arm);
     };
@@ -53,6 +58,7 @@ export function useAccessibility() {
   const [fontScale, setFontScaleState] = useState(readFontScale);
   const [highContrast, setHighContrastState] = useState(readHighContrast);
   const [voiceGuide, setVoiceGuideState] = useState(readVoiceGuide);
+  const [nativeScreenReader, setNativeScreenReader] = useState(readNativeScreenReader);
 
   useEffect(() => {
     applyFontScale(fontScale);
@@ -65,9 +71,10 @@ export function useAccessibility() {
   }, [highContrast]);
 
   useEffect(() => {
-    setVoiceGuide(voiceGuide);
+    setVoiceGuide(voiceGuide, !nativeScreenReader);
     localStorage.setItem(VOICE_KEY, String(voiceGuide));
-  }, [voiceGuide]);
+    localStorage.setItem(NATIVE_READER_KEY, String(nativeScreenReader));
+  }, [voiceGuide, nativeScreenReader]);
 
   const setFontScale = useCallback((v: number) => {
     setFontScaleState(Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(v))));
@@ -82,7 +89,8 @@ export function useAccessibility() {
     setHighContrast: setHighContrastState,
     voiceGuide,
     setVoiceGuide: setVoiceGuideState,
+    nativeScreenReader,
+    setNativeScreenReader,
     reset,
   };
 }
-

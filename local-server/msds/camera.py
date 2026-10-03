@@ -1,7 +1,6 @@
 """One fully independent pipeline per camera (video + audio + Whisper)."""
 from __future__ import annotations
 
-import glob
 import json
 import os
 import queue
@@ -11,16 +10,17 @@ import tempfile
 import threading
 import time
 import urllib.request
-import wave
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .binaries import (MissingExecutable, install_hint, need_exe, no_window_flags,
                        now_iso, resolve_exe)
-from .config import (AUDIO_CHUNK_SECONDS, HLS_PORT, HLS_PROBE_TTL, RTSP_PORT,
+from .config import (AUDIO_CHUNK_SECONDS,
+                     AUDIO_SILENCE_SECONDS, AUDIO_MIN_RMS, HLS_PORT, HLS_PROBE_TTL, RTSP_PORT,
                      VIDEO_FPS, VIDEO_GOP, VIDEO_MAX_WIDTH, VIDEO_THREADS,
                      WEBRTC_PORT, match_distress)
 from .whisper_engine import WHISPER
+from .streaming_audio import CaptionJob, CaptionMailbox, PcmCaptionSegmenter
 
 NO_AUDIO_MESSAGE = (
     "This camera's RTSP stream does not expose a usable audio track, so there is "
@@ -83,6 +83,11 @@ class Camera:
     last_audio_chunk_at: Optional[str] = None
     last_transcription_at: Optional[str] = None
     last_transcript: str = ""
+    partial_transcript: str = ""
+    partial_transcription_at: Optional[str] = None
+    partial_utterance_id: Optional[int] = None
+    transcription_latency_ms: Optional[float] = None
+    dropped_caption_jobs: int = 0
     # audio track discovery
     has_audio_track: Optional[bool] = None   # None = not probed yet
     audio_codec: Optional[str] = None
@@ -234,6 +239,9 @@ class Camera:
         """
         return [
             ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+nobuffer", "-flags", "low_delay",
+            "-analyzeduration", "1000000", "-probesize", "262144",
+            "-max_delay", "0", "-reorder_queue_size", "0",
             "-rtsp_transport", cand["transport"],
             "-timeout", "15000000",
             "-i", cand["url"],
@@ -268,10 +276,10 @@ class Camera:
                 if not data:
                     break
                 try:
-                    out.put(data, timeout=0.5)
+                    out.put_nowait(data)
                 except queue.Full:
-                    # Whisper is temporarily slower than real time. Drop the
-                    # oldest buffered block rather than deadlocking FFmpeg.
+                    # Capture is temporarily behind. Drop the oldest buffered
+                    # block rather than deadlocking FFmpeg.
                     try:
                         out.get_nowait()
                     except queue.Empty:
@@ -307,17 +315,10 @@ class Camera:
         if not transcript:
             return
 
-        # Overlapping RTSP chunks can return the same phrase twice in a row.
-        # Only drop it within a short window — saying "help" again later must
-        # still be published and raise the alarm again.
-        transcript_key = " ".join(transcript.lower().split()).strip(" .,!?")
-        previous_key = " ".join(self.last_transcript.lower().split()).strip(" .,!?")
-        now_ts = time.time()
-        if (transcript_key and transcript_key == previous_key
-                and now_ts - getattr(self, "_last_publish_ts", 0.0) < 6.0):
-            return
-        self._last_publish_ts = now_ts
+        self._publish_transcript(transcript)
 
+    def _publish_transcript(self, transcript: str):
+        """Only finalized acoustic results become safety events."""
         keyword, confidence = match_distress(transcript)
         timestamp = now_iso()
         self.last_transcription_at = timestamp
@@ -333,21 +334,58 @@ class Camera:
             self.events = self.events[-200:]
         print(f"[Audio {self.id}] transcript: {transcript}", flush=True)
 
-    def _audio_loop(self):
-        """Continuous RTSP audio capture -> raw PCM -> fixed WAV chunks -> Whisper.
+    def _decode_caption(self, job: CaptionJob, generation: object):
+        # Old workers and interim jobs must not decode or publish anything.
+        if (not job.is_final or self.stop_flag.is_set()
+                or getattr(self, "_caption_generation", None) is not generation):
+            return
+        if not WHISPER.available:
+            self.audio_error = WHISPER.error or "Whisper is unavailable"
+            return
+        try:
+            transcript = WHISPER.transcribe_pcm(job.pcm)
+        except Exception as exc:
+            self.audio_error = f"Whisper transcription failed: {exc}"
+            return
+        if self.stop_flag.is_set() or getattr(self, "_caption_generation", None) is not generation:
+            return
+        self.audio_error = None
+        self.transcription_latency_ms = round((time.monotonic() - job.captured_at) * 1000, 1)
+        self.partial_transcript = ""
+        self.partial_transcription_at = None
+        self.partial_utterance_id = None
+        if transcript:
+            self._publish_transcript(transcript)
+        else:
+            # Rejected noise clears the visible phrase without creating an
+            # event or restoring an older utterance from history.
+            self.last_transcript = ""
+            self.last_transcription_at = now_iso()
 
-        The FFmpeg process remains open for each candidate source. Python reads
-        its raw 16 kHz mono PCM stream and creates one WAV every
-        AUDIO_CHUNK_SECONDS seconds. This avoids depending on RTSP timestamps
-        for segment boundaries.
-        """
-        tmpdir = tempfile.mkdtemp(prefix=f"msd-audio-{self.path}-")
-        wav_path = os.path.join(tmpdir, "live-chunk.wav")
+    def _audio_loop(self):
+        """Capture continuously; decode each finalized phrase on a worker."""
         last_probe = 0.0
         cand_index = 0
-        bytes_per_second = 16000 * 2  # mono s16le
-        chunk_bytes = bytes_per_second * AUDIO_CHUNK_SECONDS
         no_pcm_timeout = max(12.0, AUDIO_CHUNK_SECONDS * 3.0)
+        generation = object()
+        self._caption_generation = generation
+        self._latest_audio_utterance = 0
+        self.last_transcript = ""
+        # A fresh empty result prevents event history from reviving old words
+        # while a newly started audio worker is waiting for its first phrase.
+        self.last_transcription_at = now_iso()
+        self.partial_transcript = ""
+        self.partial_transcription_at = None
+        self.partial_utterance_id = None
+        mailbox = CaptionMailbox()
+
+        def decode_captions() -> None:
+            while not self.stop_flag.is_set() and not mailbox.closed:
+                job = mailbox.get()
+                if job:
+                    self._decode_caption(job, generation)
+
+        threading.Thread(target=decode_captions, daemon=True).start()
 
         # Load Whisper once up-front so the failure is visible immediately.
         if WHISPER.available:
@@ -358,20 +396,9 @@ class Camera:
         else:
             self.audio_error = WHISPER.error or "Whisper is unavailable"
 
-        def transcribe_pcm(data: bytes) -> None:
-            if len(data) < 16000:  # less than ~0.5 s
-                return
-            with wave.open(wav_path, "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(16000)
-                wav.writeframes(data)
-            print(
-                f"[Audio {self.id}] PCM chunk {len(data)} bytes "
-                f"(~{len(data) / bytes_per_second:.1f}s) -> Whisper",
-                flush=True,
-            )
-            self._handle_chunk(wav_path)
+        def submit_caption(job: CaptionJob) -> None:
+            self._latest_audio_utterance = job.utterance_id
+            self.dropped_caption_jobs += mailbox.put(job)
 
         try:
             while not self.stop_flag.is_set():
@@ -442,40 +469,42 @@ class Camera:
                     daemon=True,
                 ).start()
 
-                pcm_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=256)
+                # At most ~1 s of PCM; a slow decoder cannot hold up capture.
+                pcm_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=8)
                 threading.Thread(
                     target=self._pump_audio_stdout,
                     args=(self.audio_proc, pcm_queue),
                     daemon=True,
                 ).start()
 
-                pcm = bytearray()
+                segmenter = PcmCaptionSegmenter(
+                    max_seconds=AUDIO_CHUNK_SECONDS,
+                    silence_seconds=AUDIO_SILENCE_SECONDS,
+                    min_rms=AUDIO_MIN_RMS,
+                )
+                # Preserve monotonically increasing phrase ids across reconnects.
+                segmenter.utterance_id = self._latest_audio_utterance
                 last_pcm_at = time.time()
 
-                # 3. Build deterministic fixed-size chunks from raw PCM.
+                # 3. Capture never waits for model inference or disk writes.
                 while not self.stop_flag.is_set() and self.audio_proc.poll() is None:
                     try:
-                        block = pcm_queue.get(timeout=0.5)
+                        block = pcm_queue.get(timeout=0.1)
                         if block:
-                            pcm.extend(block)
                             last_pcm_at = time.time()
+                            self.audio_connected = True
+                            self.audio_chunks += 1
+                            self.audio_bytes += len(block)
+                            self.last_audio_chunk_at = now_iso()
+                            for job in segmenter.feed(block):
+                                submit_caption(job)
                     except queue.Empty:
                         pass
-
-                    while len(pcm) >= chunk_bytes and not self.stop_flag.is_set():
-                        chunk = bytes(pcm[:chunk_bytes])
-                        del pcm[:chunk_bytes]
-                        try:
-                            transcribe_pcm(chunk)
-                            self.audio_error = None
-                        except Exception as exc:
-                            self.audio_error = f"Audio chunk failed: {exc}"
 
                     # FFmpeg can remain connected to an RTSP stream that contains
                     # no audio packets. Rotate sources instead of waiting forever.
                     if (
-                        self.audio_chunks == chunks_before
-                        and time.time() - last_pcm_at > no_pcm_timeout
+                        time.time() - last_pcm_at > no_pcm_timeout
                     ):
                         self.audio_ffmpeg_error = (
                             self.audio_ffmpeg_error
@@ -491,11 +520,9 @@ class Camera:
                     break
 
                 # Process a useful final partial chunk before switching sources.
-                if len(pcm) >= 16000:
-                    try:
-                        transcribe_pcm(bytes(pcm))
-                    except Exception as exc:
-                        self.audio_error = f"Audio chunk failed: {exc}"
+                final = segmenter.flush()
+                if final:
+                    submit_caption(final)
 
                 code = self.audio_proc.poll()
                 produced = self.audio_chunks > chunks_before
@@ -521,6 +548,13 @@ class Camera:
                 last_probe = 0.0
                 self.stop_flag.wait(2)
         finally:
+            mailbox.close()
+            self._caption_generation = None
+            self.last_transcript = ""
+            self.last_transcription_at = now_iso()
+            self.partial_transcript = ""
+            self.partial_transcription_at = None
+            self.partial_utterance_id = None
             self.audio_connected = False
             if self.audio_proc and self.audio_proc.poll() is None:
                 try:
@@ -528,7 +562,6 @@ class Camera:
                     self.audio_proc.wait(timeout=5)
                 except Exception:
                     self.audio_proc.kill()
-            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def audio_test(self) -> dict:
         """One-shot diagnostic: probe the streams, then try to grab a short WAV
@@ -657,6 +690,11 @@ class Camera:
         self.video_proc = None
         self.audio_proc = None
         self.audio_connected = False
+        self.last_transcript = ""
+        self.last_transcription_at = now_iso()
+        self.partial_transcript = ""
+        self.partial_transcription_at = None
+        self.partial_utterance_id = None
         self._hls_ok = False
         self._hls_checked = 0.0
 
@@ -714,6 +752,15 @@ class Camera:
             "last_chunk_at": self.last_audio_chunk_at,
             "last_transcription_at": self.last_transcription_at,
             "last_transcript": self.last_transcript,
+            "partial_transcript": self.partial_transcript,
+            "partial_transcription_at": self.partial_transcription_at,
+            "partial_utterance_id": self.partial_utterance_id,
+            "transcription_latency_ms": self.transcription_latency_ms,
+            "dropped_caption_jobs": self.dropped_caption_jobs,
+            # Legacy fields remain for older clients; drafts are disabled.
+            "caption_update_seconds": 0,
+            "caption_silence_seconds": AUDIO_SILENCE_SECONDS,
+            "transcription_mode": "final",
             "has_audio_track": self.has_audio_track,
             "audio_codec": self.audio_codec,
             "audio_probe_error": self.audio_probe_error,

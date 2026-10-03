@@ -12,4 +12,8 @@ contextBridge.exposeInMainWorld('msds', {
   /** { managed, running, error } for the Electron-managed Python bridge. */
   getLocalServerStatus: () => ipcRenderer.invoke('msds:localServerStatus'),
   openExternal: (url) => ipcRenderer.invoke('msds:openExternal', url),
+  chooseClipFolder: () => ipcRenderer.invoke('msds:chooseClipFolder'),
+  getClipFolder: () => ipcRenderer.invoke('msds:getClipFolder'),
+  forgetClipFolder: () => ipcRenderer.invoke('msds:forgetClipFolder'),
+  saveClip: (data, filename) => ipcRenderer.invoke('msds:saveClip', data, filename),
 });

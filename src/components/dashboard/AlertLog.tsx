@@ -59,6 +59,7 @@ export default function AlertLog({ alerts, visible, snapshots = [], onAlertClick
       </div>
 
       {/* Snapshot viewer modal */}
+      <p className="text-xs text-muted-foreground">The completed batch clears when the next alert arrives after 50 alerts.</p>
       {viewingSnapshot && (
         <div className="space-y-1 p-2 bg-secondary/50 rounded border border-primary/30">
           <div className="flex items-center justify-between">

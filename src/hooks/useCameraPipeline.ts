@@ -5,6 +5,7 @@ import { detectObjects, loadDetector } from '@/lib/detectionEngine';
 import { computeSaliency, computeSaliencyScore } from '@/lib/saliency';
 import { createFireState, detectFire } from '@/lib/fireDetection';
 import { describeAudioStatus, getAudioEvents, getCameraSnapshot } from '@/lib/multiCamServer';
+import { latestFinalTranscript, transcriptRemainingMs, TRANSCRIPT_CLEAR_MS } from '@/lib/transcription';
 import { useFaceDistress } from '@/hooks/useFaceDistress';
 import { matchWakeWord } from '@/lib/safetyLexicon';
 import type {
@@ -13,9 +14,14 @@ import type {
 import { hlsUrlFor, webrtcUrlFor } from '@/types/multicam';
 
 const HUMAN_LABELS = new Set(['person']);
-/** Live CCTV text disappears this long after the last words were heard. */
-const TRANSCRIPT_CLEAR_MS = 5000;
+const DISPLAY_LABELS = new Set(['tv', 'cell phone', 'laptop', 'monitor', 'tablet', 'television']);
 const SNAPSHOT_INTERVAL_MS = 3000;
+const MONITORING_SNAPSHOT_INTERVAL_MS = 500;
+const AUDIO_POLL_INTERVAL_MS = 200;
+const VISUAL_INTERVAL_MS = 100;
+const OBJECT_INTERVAL_MS = 200;
+const FACE_INTERVAL_MS = 200;
+const OBJECT_MAX_AGE_MS = 1500;
 
 type FrameCapture = { grabFrame: () => Promise<ImageBitmap> };
 type ImageCaptureConstructor = new (track: MediaStreamTrack) => FrameCapture;
@@ -67,6 +73,7 @@ const emptyRuntime = (cameraId: string): CameraRuntime => ({
   faceDistress: { detected: false, label: '', confidence: 0 },
   audioDistress: { detected: false, keyword: '', confidence: 0, transcript: '' },
   transcript: '',
+  interimTranscript: '',
   audioListening: false,
   audio: null,
   audioMessage: 'Connect this camera to start listening.',
@@ -106,6 +113,11 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
   const fireStateRef = useRef(createFireState());
   const prevFrameRef = useRef<ImageData | null>(null);
   const busyRef = useRef(false);
+  const objectCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastObjectStartedRef = useRef(0);
+  const lastObjectAtRef = useRef(0);
+  const lastFaceStartedRef = useRef(0);
+  const latestFrameRef = useRef(0);
   const analysisRevisionRef = useRef(0);
   const faceAnalysisRevisionRef = useRef<number | null>(null);
   const analysisActiveRef = useRef(camera.enabled && camera.aiEnabled);
@@ -113,8 +125,10 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
   const framesRef = useRef(0);
   const lastFpsRef = useRef(Date.now());
   const lastAudioRef = useRef<string | undefined>(undefined);
-  const lastShownRef = useRef<string>('');
+  const lastTranscriptRevisionRef = useRef('');
+  const audioSourceRef = useRef('');
   const clearTimerRef = useRef<number | undefined>(undefined);
+  const audioDistressTimerRef = useRef<number | undefined>(undefined);
 
   const cooldownRef = useRef<Record<string, number>>({});
   const retryRef = useRef(0);
@@ -164,6 +178,9 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
   useEffect(() => {
     analysisRevisionRef.current += 1;
     faceAnalysisRevisionRef.current = null;
+    lastObjectAtRef.current = 0;
+    lastObjectStartedRef.current = 0;
+    lastFaceStartedRef.current = 0;
     if (!camera.enabled || !camera.aiEnabled) {
       prevFrameRef.current = null;
       fireStateRef.current = createFireState();
@@ -177,11 +194,17 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
     return () => { analysisRevisionRef.current += 1; };
   }, [camera.enabled, camera.aiEnabled, camera.id, sourceStream, playbackEnabled, settings.objectThreshold, settings.fireThreshold, settings.saliencyThreshold, settings.priorityObjects, patch]);
 
-  /** Newest Whisper sentence replaces the old one and clears after 5 s. */
-  const showTranscript = useCallback((text: string) => {
-    patch({ transcript: text });
+  /** A final utterance replaces prior words; polls never extend its lifetime. */
+  const showTranscript = useCallback((text: string, remainingMs: number) => {
     if (clearTimerRef.current) window.clearTimeout(clearTimerRef.current);
-    clearTimerRef.current = window.setTimeout(() => patch({ transcript: '' }), TRANSCRIPT_CLEAR_MS);
+    clearTimerRef.current = undefined;
+    patch({ transcript: remainingMs > 0 ? text : '', interimTranscript: '' });
+    if (text && remainingMs > 0) {
+      clearTimerRef.current = window.setTimeout(() => {
+        clearTimerRef.current = undefined;
+        patch({ transcript: '' });
+      }, remainingMs);
+    }
   }, [patch]);
 
   useEffect(() => () => { if (clearTimerRef.current) window.clearTimeout(clearTimerRef.current); }, []);
@@ -195,7 +218,8 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
     (type: DetectionEvent['type'], label: string, confidence: number, withSnapshot = true) => {
       const now = Date.now();
       const key = `${type}:${label}`;
-      if (cooldownRef.current[key] && now - cooldownRef.current[key] < 15000) return;
+      const cooldown = ['fire', 'smoke', 'face-distress', 'audio-distress'].includes(type) ? 3000 : 15000;
+      if (cooldownRef.current[key] && now - cooldownRef.current[key] < cooldown) return;
       cooldownRef.current[key] = now;
       runtimeRef.current.alerts += 1;
       onEventRef.current?.({
@@ -380,64 +404,87 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
     height: number,
     isStopped: () => boolean,
   ) => {
-    if (!camera.enabled || isStopped() || busyRef.current) return;
+    if (!camera.enabled || isStopped()) return;
     const revision = analysisRevisionRef.current;
     const cancelled = () => isStopped()
       || revision !== analysisRevisionRef.current || !analysisActiveRef.current;
-    busyRef.current = true;
     const started = performance.now();
     try {
       const drawn = drawWorkFrame(source, width, height);
       if (!drawn) return;
       if (!camera.aiEnabled || cancelled()) return;
       const { canvas, frame } = drawn;
-      // Objects + humans
-      const objects = await detectObjects(canvas, settings.objectThreshold);
-      if (cancelled()) return;
-      const humanCount = objects.filter(o => HUMAN_LABELS.has(o.label)).length;
-
+      const frameId = ++latestFrameRef.current;
       const sal = computeSaliency(frame, prevFrameRef.current, 'sobel', settings.saliencyThreshold ?? 40);
       prevFrameRef.current = frame;
       const saliencyScore = computeSaliencyScore(sal);
-      const objectScore = objects.length > 0
-        ? Math.max(...objects.map(object => object.confidence * 100)) : 0;
-      const audioScore = runtimeRef.current.audioDistress.detected
-        ? runtimeRef.current.audioDistress.confidence * 100 : 0;
-      const attentionScore = Math.min(100, Math.round(
-        0.5 * saliencyScore + 0.3 * objectScore + 0.2 * audioScore,
+      const fuseAttention = (objects = runtimeRef.current.objects) => Math.min(100, Math.round(
+        0.5 * runtimeRef.current.saliencyScore
+        + 0.3 * Math.max(0, ...objects.map(object => object.confidence * 100))
+        + 0.2 * (runtimeRef.current.audioDistress.detected ? runtimeRef.current.audioDistress.confidence * 100 : 0),
       ));
-      const fire = detectFire(frame, fireStateRef.current, objects);
-      faceAnalysisRevisionRef.current = revision;
-      await analyzeFace(canvas);
-      if (cancelled()) return;
-
+      // Publish cheap metrics immediately. Neither neural model holds up the UI.
       patch({
-        objects, humanCount, saliencyScore, attentionScore,
+        saliencyScore,
         frameWidth: canvas.width, frameHeight: canvas.height,
-        fire: {
-          detected: fire.fireDetected && fire.confidence >= settings.fireThreshold,
-          confidence: fire.confidence,
-          bbox: fire.smoothedBbox,
-        },
-        smoke: { detected: fire.smokeEmergency, confidence: fire.smokeRatio },
         lastDetectionAt: new Date().toISOString(),
-        detections: runtimeRef.current.detections + objects.length,
         latencyMs: Math.round(performance.now() - started),
       });
-
-      const historyObjects = settings.priorityObjects
-        ? objects.filter(object => HUMAN_LABELS.has(object.label) || settings.priorityObjects.includes(object.label))
-        : objects;
-      for (const object of historyObjects) emit('object', object.label, object.confidence, false);
-      if (humanCount > 0) emit('human', `${humanCount} person(s)`, 0.9, false);
-      if (fire.fireDetected && fire.confidence >= settings.fireThreshold) emit('fire', 'Fire detected', fire.confidence);
-      if (fire.smokeEmergency) emit('smoke', 'Smoke / low visibility', fire.smokeRatio);
+      const attentionScore = fuseAttention();
+      patch({ attentionScore });
       if (saliencyScore > 70) emit('saliency', `High saliency (${saliencyScore})`, saliencyScore / 100, false);
       if (attentionScore > 70) emit('saliency', `High attention (${attentionScore})`, attentionScore / 100, false);
+
+      const analyzeFire = (objects = runtimeRef.current.objects) => {
+        if (cancelled()) return;
+        const fire = detectFire(frame, fireStateRef.current, objects);
+        patch({
+          fire: { detected: fire.fireDetected && fire.confidence >= settings.fireThreshold,
+            confidence: fire.confidence, bbox: fire.smoothedBbox,
+            classification: fire.classification, rejectedReason: fire.rejectedReason },
+          fireAnalysis: fire,
+          smoke: { detected: fire.smokeEmergency, confidence: fire.smokeRatio },
+        });
+        if (fire.fireDetected && fire.confidence >= settings.fireThreshold) {
+          emit('fire', fire.largeFire ? 'Large fire detected' : 'Fire detected', fire.confidence);
+        }
+        if (fire.smokeEmergency) emit('smoke', 'Smoke / low visibility', fire.smokeRatio);
+      };
+      // Screen exclusions need a recent object pass. Never assume an unscanned
+      // orange rectangle is a real flame while the display detector is loading.
+      const objectsFresh = lastObjectAtRef.current > 0 && Date.now() - lastObjectAtRef.current <= OBJECT_MAX_AGE_MS;
+      if (objectsFresh) analyzeFire();
+
+      if (Date.now() - lastFaceStartedRef.current >= FACE_INTERVAL_MS) {
+        lastFaceStartedRef.current = Date.now();
+        faceAnalysisRevisionRef.current = revision;
+        void analyzeFace(canvas).catch(() => {});
+      }
+      if (busyRef.current || Date.now() - lastObjectStartedRef.current < OBJECT_INTERVAL_MS) return;
+      const objectCanvas = objectCanvasRef.current ?? (objectCanvasRef.current = document.createElement('canvas'));
+      objectCanvas.width = canvas.width; objectCanvas.height = canvas.height;
+      objectCanvas.getContext('2d')?.drawImage(canvas, 0, 0);
+      busyRef.current = true;
+      lastObjectStartedRef.current = Date.now();
+      const objectStarted = performance.now();
+      void detectObjects(objectCanvas, Math.min(settings.objectThreshold, 0.45)).then(predictions => {
+        if (cancelled()) return;
+        const objects = predictions.filter(object => object.confidence >= settings.objectThreshold || DISPLAY_LABELS.has(object.label));
+        lastObjectAtRef.current = Date.now();
+        const humanCount = objects.filter(o => HUMAN_LABELS.has(o.label)).length;
+        patch({ objects, humanCount, attentionScore: fuseAttention(objects),
+          objectLatencyMs: Math.round(performance.now() - objectStarted),
+          detections: runtimeRef.current.detections + objects.length });
+        // Only score this captured frame if it is still the latest one.
+        if (!objectsFresh && latestFrameRef.current === frameId) analyzeFire(objects);
+        const historyObjects = settings.priorityObjects
+          ? objects.filter(object => HUMAN_LABELS.has(object.label) || settings.priorityObjects.includes(object.label))
+          : objects;
+        for (const object of historyObjects) emit('object', object.label, object.confidence, false);
+        if (humanCount > 0) emit('human', `${humanCount} person(s)`, 0.9, false);
+      }).catch(() => {}).finally(() => { busyRef.current = false; });
     } catch {
       // A detector failure does not interrupt previews, playback, or audio.
-    } finally {
-      busyRef.current = false;
     }
   }, [camera.enabled, camera.aiEnabled, settings.objectThreshold, settings.fireThreshold, settings.saliencyThreshold, settings.priorityObjects, analyzeFace, drawWorkFrame, patch, emit]);
   const analyzeFrameRef = useRef(analyzeFrame);
@@ -448,13 +495,15 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
     void loadDetector().catch(() => {});
   }, [camera.enabled, camera.aiEnabled]);
 
-  // Decode only a JPEG every three seconds on the dashboard. This leaves the
+  // Monitoring samples stills twice a second; idle previews use three seconds.
+  // Requests never overlap. This leaves the
   // backend's audio listener active without a browser video or HLS connection.
   useEffect(() => {
     if (!camera.enabled || playbackEnabled) return;
     let stopped = false;
     let inFlight = false;
     let request: AbortController | null = null;
+    let lastSnapshotTimestamp: number | null = null;
     const canvas = document.createElement('canvas');
     const Capture = (window as Window & { ImageCapture?: ImageCaptureConstructor }).ImageCapture;
     const track = sourceStream?.getVideoTracks()[0];
@@ -482,7 +531,7 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
           timestamp = Date.now();
         } else {
           request = new AbortController();
-          const result = await getCameraSnapshot(settings.pythonServer, camera.id, request.signal);
+          const result = await getCameraSnapshot(settings.pythonServer, camera.id, request.signal, analysisActiveRef.current);
           if (stopped) return;
           decoded = await decodeSnapshot(result.blob, request.signal);
           timestamp = result.timestamp;
@@ -502,7 +551,10 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
         // The analyzer copies pixels synchronously before its first await. Let
         // a slow model finish independently so still previews keep refreshing,
         // and release the decoded full-size bitmap as soon as it is copied.
-        void analyzeFrameRef.current(decoded.image, decoded.width, decoded.height, () => stopped);
+        if (timestamp !== lastSnapshotTimestamp) {
+          lastSnapshotTimestamp = timestamp;
+          void analyzeFrameRef.current(decoded.image, decoded.width, decoded.height, () => stopped);
+        }
       } catch (error) {
         if (!stopped) patch({ status: 'error', fps: 0, error: error instanceof Error ? error.message : 'Camera snapshot unavailable.' });
       } finally {
@@ -512,9 +564,9 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
       }
     };
     void tick();
-    const id = window.setInterval(tick, SNAPSHOT_INTERVAL_MS);
+    const id = window.setInterval(tick, camera.aiEnabled ? MONITORING_SNAPSHOT_INTERVAL_MS : SNAPSHOT_INTERVAL_MS);
     return () => { stopped = true; window.clearInterval(id); request?.abort(); };
-  }, [camera.enabled, camera.id, playbackEnabled, sourceStream, settings.pythonServer, nonce, patch, drawWorkFrame]);
+  }, [camera.enabled, camera.aiEnabled, camera.id, playbackEnabled, sourceStream, settings.pythonServer, nonce, patch, drawWorkFrame]);
 
   // Live frames are processed only while their camera player is visible.
   useEffect(() => {
@@ -522,10 +574,10 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
     let stopped = false;
     const tick = async () => {
       const video = videoRef.current;
-      if (stopped || busyRef.current || !video || video.readyState < 2 || !video.videoWidth) return;
+      if (stopped || !video || video.readyState < 2 || !video.videoWidth) return;
       await analyzeFrameRef.current(video, video.videoWidth, video.videoHeight, () => stopped);
     };
-    const id = window.setInterval(tick, 350);
+    const id = window.setInterval(tick, VISUAL_INTERVAL_MS);
     return () => { stopped = true; window.clearInterval(id); };
   }, [camera.enabled, camera.aiEnabled, playbackEnabled]);
 
@@ -535,6 +587,7 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
     const d = face.distress;
     const detected = d.hasFace && d.distressLevel !== 'none';
     patch({
+      faceLatencyMs: face.latencyMs,
       faceDistress: {
         detected,
         label: d.expression ?? '',
@@ -542,17 +595,26 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
       },
     });
     if (d.distressLevel === 'severe') emit('face-distress', d.expression || 'distress', d.distressScore / 100);
-  }, [camera.enabled, camera.aiEnabled, face.distress, patch, emit]);
+  }, [camera.enabled, camera.aiEnabled, face.distress, face.latencyMs, patch, emit]);
 
   // ---- Audio: RTSP audio -> ffmpeg -> Whisper on the backend ---------------
   // The browser never opens a microphone. Listening runs whenever the camera is
   // connected, independently of the AI detection switch.
   useEffect(() => {
+    const source = `${settings.pythonServer}:${camera.id}`;
+    if (audioSourceRef.current !== source) {
+      audioSourceRef.current = source;
+      lastAudioRef.current = undefined;
+      lastTranscriptRevisionRef.current = '';
+      showTranscript('', 0);
+    }
     if (sourceStream) {
+      showTranscript('', 0);
       patch({ audioListening: false, audioMessage: 'Local microphone listening is managed on the dashboard.', audioTone: 'wait' });
       return;
     }
     if (!camera.enabled) {
+      showTranscript('', 0);
       patch({
         audioListening: false,
         audioMessage: 'Connect this camera to start listening.',
@@ -575,23 +637,24 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
         const described = describeAudioStatus(status, true);
         patch({
           audio: status,
+          interimTranscript: '',
           audioBackendReachable: true,
           audioMessage: described.message,
           audioTone: described.tone,
         });
 
-        // New events are authoritative; when a poll brings none but the backend
-        // already holds a transcript we still show it, so the panel is never
-        // stuck on "no speech yet" while the backend has words.
         const fresh = events ?? [];
+        const final = latestFinalTranscript(fresh, status);
+        const revision = final ? `${final.timestamp}:${final.text}` : '';
+        if (final && revision !== lastTranscriptRevisionRef.current) {
+          lastTranscriptRevisionRef.current = revision;
+          showTranscript(final.text, transcriptRemainingMs(final.timestamp));
+        }
         if (fresh.length) {
           lastAudioRef.current = fresh[fresh.length - 1].timestamp;
-          const spoken = fresh.map(e => e.transcript).filter(Boolean).join(' ').trim();
-          if (spoken && spoken !== lastShownRef.current) {
-            lastShownRef.current = spoken;
-            showTranscript(spoken);
-          }
           for (const e of fresh) {
+            // Retained event history belongs in the sidebar, not in new alerts.
+            if (transcriptRemainingMs(e.timestamp) === 0) continue;
             // Backend keyword list OR the full Tagalog/English safety library.
             const safety = matchWakeWord(e.transcript || '');
             const keyword = safety.matched ? safety.phrase : e.keyword;
@@ -601,16 +664,18 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
               audioDistress: {
                 detected: true, keyword, confidence, transcript: e.transcript,
               },
+              attentionScore: Math.min(100, Math.round(0.5 * runtimeRef.current.saliencyScore
+                + 0.3 * Math.max(0, ...runtimeRef.current.objects.map(object => object.confidence * 100))
+                + 0.2 * confidence * 100)),
             });
+            window.clearTimeout(audioDistressTimerRef.current);
+            audioDistressTimerRef.current = window.setTimeout(() => {
+              patch({ audioDistress: { detected: false, keyword: '', confidence: 0, transcript: '' },
+                attentionScore: Math.min(100, Math.round(0.5 * runtimeRef.current.saliencyScore
+                  + 0.3 * Math.max(0, ...runtimeRef.current.objects.map(object => object.confidence * 100)))) });
+            }, TRANSCRIPT_CLEAR_MS);
             emit('audio-distress', `Safety word: "${keyword}"`, confidence);
           }
-        } else if (
-          status?.last_transcript
-          && !runtimeRef.current.transcript
-          && status.last_transcript !== lastShownRef.current
-        ) {
-          lastShownRef.current = status.last_transcript;
-          showTranscript(status.last_transcript);
         }
       } catch (err) {
         if (stopped) return;
@@ -626,9 +691,14 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
       }
     };
 
-    const id = window.setInterval(poll, 1500);
+    const id = window.setInterval(poll, AUDIO_POLL_INTERVAL_MS);
     void poll();
-    return () => { stopped = true; window.clearInterval(id); patch({ audioListening: false }); };
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+      window.clearTimeout(audioDistressTimerRef.current);
+      patch({ audioListening: false, audioDistress: { detected: false, keyword: '', confidence: 0, transcript: '' } });
+    };
   }, [camera.enabled, camera.id, sourceStream, settings.pythonServer, settings.audioThreshold, patch, emit, showTranscript]);
 
 

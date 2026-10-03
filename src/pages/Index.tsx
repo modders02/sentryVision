@@ -4,7 +4,7 @@ import { Moon, Sun, Home, LogOut, Shield, Wifi, X, Flame, HelpCircle, Menu, Spar
 import DashboardCameraCard from '@/components/dashboard/DashboardCameraCard';
 import CameraMonitor from '@/components/dashboard/CameraMonitor';
 import Monitoring from '@/pages/Monitoring';
-import AlertLog from '@/components/dashboard/AlertLog';
+import DashboardEvents from '@/components/dashboard/DashboardEvents';
 import ControlsPanel from '@/components/dashboard/ControlsPanel';
 import AttentionGauge from '@/components/dashboard/AttentionGauge';
 import DetectionFeedback from '@/components/dashboard/DetectionFeedback';
@@ -28,7 +28,9 @@ import { sendAlertEmail } from '@/lib/alertEmail';
 import { stopAll as stopAllCameras, stopCamera } from '@/lib/multiCamServer';
 import { matchWakeWord } from '@/lib/safetyLexicon';
 import { getCameraSession } from '@/lib/cameraSessions';
-import { clipFileName, recordClip, saveClip } from '@/lib/clipRecorder';
+import { appendAlertBatch } from '@/lib/alertHistory';
+import { clipFileName, recordClip, saveClip, restoreClipFolder, getClipFolderLabel, reportClipStatus, NO_CLIP_FOLDER_MESSAGE } from '@/lib/clipRecorder';
+import { recordCameraClip } from '@/lib/cameraRecording';
 import type { CameraRuntime, DetectionEvent } from '@/types/multicam';
 import type { Alert, QualityMode } from '@/types/dashboard';
 import { DEFAULT_PRIORITY_OBJECTS } from '@/types/dashboard';
@@ -62,9 +64,9 @@ const ALGORITHM_TOURS: Record<AlgorithmId, TutorialStep[]> = {
   face: [
     {
       selector: '#tour-face-distress', placement: 'top', title: 'Facial distress',
-      body: 'TinyFaceDetector finds the nearest face. Expression scores are weighted for safety and averaged across five samples to prevent flickering alerts.',
+      body: 'TinyFaceDetector finds faces; the largest face is scored. Expression probabilities are weighted and averaged across three samples. This is a visual distress heuristic.',
       implementation: 'src/hooks/useFaceDistress.ts',
-      code: `distress = sad + 1.4*fearful + 0.8*angry + 0.7*disgusted;\nscore = average(lastFiveSamples);`,
+      code: `distress = min(100, round(100*(sad + 1.4*fearful + 0.8*angry + 0.7*disgusted)));\nscore = average(lastThreeSamples);`,
     },
   ],
   speech: [
@@ -171,9 +173,6 @@ export default function Index() {
     for (const event of events) counts.set(event.cameraId, (counts.get(event.cameraId) || 0) + 1);
     return counts;
   }, [events]);
-  const alertSnapshots = useMemo(() => events.filter(event => event.snapshot).slice(0, 50).map(event => ({
-    id: event.id, timestamp: new Date(event.timestamp), dataUrl: event.snapshot!, reason: event.label,
-  })), [events]);
   useWakeLock(running || connected.length > 0);
 
   useEffect(() => {
@@ -229,17 +228,34 @@ export default function Index() {
     const id = crypto.randomUUID();
     addEvent({ ...event, id });
     const video = getCameraSession(event.cameraId).video;
-    // Recording borrows an already-playing live feed; it never opens video on the dashboard.
-    if (!video || !EMERGENCY_TYPES.has(event.type) || recordingCameras.current.has(event.cameraId)) return id;
+    if (!EMERGENCY_TYPES.has(event.type) || recordingCameras.current.has(event.cameraId)) return id;
     recordingCameras.current.add(event.cameraId);
-    void recordClip(video).then(async blob => {
-      if (!blob) return;
-      const name = clipFileName(event.cameraName, event.type);
+    void (async () => {
+      await restoreClipFolder();
+      if (!getClipFolderLabel()) throw new Error(NO_CLIP_FOLDER_MESSAGE);
+      reportClipStatus({ state: 'recording', message: `${event.cameraName}: Recording a 10 second clip…` });
+      const index = Number(event.cameraId.replace('slot-', '')) || 1;
+      const stream = cameras[index - 1]?.stream;
+      // Borrow live playback or a webcam stream; CCTV still view records on the
+      // bridge from its existing restream without opening dashboard playback.
+      let localVideo: HTMLVideoElement | null = null;
+      try {
+        if (!video && stream) {
+          localVideo = document.createElement('video');
+          localVideo.srcObject = stream;
+        }
+        const blob = video || localVideo
+          ? await recordClip((video || localVideo)!)
+          : await recordCameraClip(settings.pythonServer, event.cameraId);
+        if (!blob) throw new Error('Could not record a clip from this camera.');
+        const name = clipFileName(event.cameraName, event.type, blob.type);
       await saveClip(blob, name);
       updateEvent(id, { clipFile: name, clipUrl: URL.createObjectURL(blob) });
-    }).catch(error => console.warn('[Camera clip]', error)).finally(() => recordingCameras.current.delete(event.cameraId));
+      } finally { if (localVideo) localVideo.srcObject = null; }
+    })().catch(error => reportClipStatus({ state: 'error', message: error instanceof Error ? error.message : 'Could not save the emergency recording.' }))
+      .finally(() => recordingCameras.current.delete(event.cameraId));
     return id;
-  }, [addEvent, updateEvent]);
+  }, [addEvent, updateEvent, cameras, settings.pythonServer]);
 
   const raiseAlert = useCallback((event: Omit<DetectionEvent, 'id'>, severity: Alert['severity'], alreadyStored = false) => {
     const key = `${event.cameraId}:${event.label}`;
@@ -248,7 +264,7 @@ export default function Index() {
     alertCooldown.current.set(key, now);
     const id = alreadyStored ? crypto.randomUUID() : storeEvent(event);
     const index = Number(event.cameraId.replace('slot-', '')) || 1;
-    setAlerts(previous => [{ id, timestamp: new Date(event.timestamp), message: `${event.cameraName}: ${event.label}`, severity, cameraId: index }, ...previous].slice(0, 100));
+    setAlerts(previous => appendAlertBatch(previous, { id, timestamp: new Date(event.timestamp), message: `${event.cameraName}: ${event.label}`, severity, cameraId: index }));
     if (severity === 'high' || severity === 'critical') {
       announce(`Alert. ${event.cameraName}. ${event.label}`, true);
       void logAlert(event.type, `${event.cameraName}: ${event.label}`);
@@ -285,7 +301,7 @@ export default function Index() {
   // A local webcam uses the existing local microphone. CCTV speech comes only from its bridge.
   useEffect(() => {
     if (!running || !localCameras.length || connected.length) return;
-    const text = `${speech.transcript} ${speech.interimTranscript}`.trim();
+    const text = speech.transcript.trim();
     const household = checkForWakeWord(text);
     const safety = matchWakeWord(text);
     if (!household.matched && !safety.matched) return;
@@ -296,7 +312,7 @@ export default function Index() {
       label: `Wake word: "${phrase}"`, confidence: household.matched ? 1 : safety.confidence,
       timestamp: new Date().toISOString(), snapshot: getCameraSession('slot-1').preview || undefined,
     }, emergency ? 'critical' : 'high');
-  }, [running, localCameras.length, connected.length, speech.transcript, speech.interimTranscript, checkForWakeWord, slots, raiseAlert]);
+  }, [running, localCameras.length, connected.length, speech.transcript, speech.transcriptRevision, checkForWakeWord, slots, raiseAlert]);
 
   useEffect(() => {
     if (!running || !localCameras.length || connected.length || !['scream', 'bang'].includes(audioFeatures.audioEvent)) return;
@@ -400,7 +416,7 @@ export default function Index() {
             </div>
             <div id="tour-cams"><div id="tour-fused-view" className="grid grid-cols-1 gap-4 xl:grid-cols-2">
               {slots.map(slot => <DashboardCameraCard key={slot.index} slot={slot} monitoring={running} mirror={mirror}
-                transcript={slot.index === 1 && localAudioEnabled ? `${speech.transcript} ${speech.interimTranscript}`.trim() : undefined}
+                transcript={slot.index === 1 && localAudioEnabled ? speech.transcript : undefined}
                 eventCount={eventCounts.get(`slot-${slot.index}`) || 0} onConnect={openConnection}
                 onToggleAi={index => updateSlot(index, { aiEnabled: !slots[index - 1].aiEnabled })} />)}
             </div></div>
@@ -417,7 +433,11 @@ export default function Index() {
               <div className="grid gap-3 sm:grid-cols-3">
                 <div id="tour-fire-analysis" className={`rounded-lg border p-3 ${currentRuntime?.fire.detected || currentRuntime?.smoke.detected ? 'border-destructive/50 bg-destructive/5' : 'border-border'}`}>
                   <h3 className="flex items-center gap-2 text-sm"><Flame className="h-4 w-4" />Fire &amp; smoke</h3>
-                  <p className="mt-1 text-sm text-muted-foreground">{currentRuntime?.fire.detected ? 'Fire detected' : currentRuntime?.smoke.detected ? 'Smoke detected' : 'No fire or smoke detected'}</p>
+                  <p className="mt-1 text-sm text-muted-foreground">{currentRuntime?.fire.detected ? currentRuntime.fireAnalysis?.largeFire ? 'Large fire detected' : 'Fire detected'
+                    : currentRuntime?.smoke.detected ? 'Smoke / low visibility detected'
+                    : currentRuntime?.fire.classification === 'electronics-with-fire' ? 'Electronics with fire: display footage excluded'
+                    : 'No fire or smoke detected'}</p>
+                  {currentRuntime?.fireAnalysis && <p className="mt-1 text-xs text-muted-foreground">Visibility {currentRuntime.fireAnalysis.visibility}/100 · Smoke-colored area {Math.round(currentRuntime.fireAnalysis.smokeRatio * 100)}%</p>}
                   {currentRuntime?.fire.detected && <DetectionFeedback householdId={householdId} eventType="fire" confidence={currentRuntime.fire.confidence} />}
                 </div>
                 <div id="tour-audio-distress" className="rounded-lg border border-border p-3">
@@ -434,21 +454,21 @@ export default function Index() {
           </div>
 
           {sidebarOpen && <button aria-label="Close controls overlay" onClick={() => setSidebarOpen(false)} className="fixed inset-0 z-40 bg-black/40 lg:hidden" />}
-          <aside id="tour-sidebar" className={`${sidebarOpen ? 'block' : 'hidden lg:block'} fixed right-0 top-0 z-50 h-full w-80 max-w-[90vw] space-y-3 overflow-y-auto border-l border-border bg-card p-3 lg:static lg:z-auto lg:h-auto lg:shrink-0 lg:bg-transparent`}>
-            <button onClick={() => setSidebarOpen(false)} aria-label="Close controls" className="ml-auto block rounded-lg p-2 lg:hidden"><X className="h-4 w-4" /></button>
+          <aside id="tour-sidebar" aria-label="Camera controls and activity sidebar" className={`${sidebarOpen ? 'fixed right-0 top-0 z-50 h-full w-80 max-w-[90vw]' : 'relative w-full'} min-w-0 space-y-3 overflow-y-auto border-t border-border bg-card p-3 lg:static lg:z-auto lg:h-auto lg:w-[360px] lg:max-w-none lg:shrink-0 lg:border-l lg:border-t-0 lg:bg-transparent`}>
+            {sidebarOpen && <button onClick={() => setSidebarOpen(false)} aria-label="Close controls" className="ml-auto block rounded-lg p-2 lg:hidden"><X className="h-4 w-4" /></button>}
             <div id="tour-start" className="rounded-xl border border-border bg-card p-3">
               <button onClick={running ? handleStop : handleStart} className={`w-full rounded-lg px-3 py-2.5 text-sm ${running ? 'bg-destructive text-destructive-foreground' : 'bg-primary text-primary-foreground'}`}>{running ? 'Stop Monitoring' : 'Start Monitoring'}</button>
               <p className="mt-2 text-center text-sm text-muted-foreground">{running ? 'Snapshot detection and audio triggers are active.' : 'Connect a camera, then start monitoring.'}</p>
             </div>
             <AttentionGauge score={attention} />
-            <div id="tour-alert-log"><AlertLog alerts={alerts} visible={showAlerts} snapshots={alertSnapshots} /></div>
+            <div id="tour-alert-log"><DashboardEvents syncUrl={false} showAlerts={showAlerts} /></div>
             <ControlsPanel snapshotMode running={running} threshold={settings.saliencyThreshold ?? 40} showBoundingBoxes={showBoundingBoxes} showHeatmap={showHeatmap} showAlerts={showAlerts}
               quality={quality} mirror={mirror} heatmapOpacity={heatmapOpacity} simulationMode={simulationMode} priorityObjects={priorityObjects} minConfidence={Math.round(settings.objectThreshold * 100)}
               onStart={handleStart} onStop={handleStop} onThresholdChange={value => updateSettings({ saliencyThreshold: value })} onToggleBoundingBoxes={() => setShowBoundingBoxes(value => !value)}
               onToggleHeatmap={() => setShowHeatmap(value => !value)} onToggleAlerts={() => setShowAlerts(value => !value)} onQualityChange={setQuality}
               onToggleMirror={() => setMirror(value => !value)} onHeatmapOpacityChange={setHeatmapOpacity} onToggleSimulation={() => setSimulationMode(value => !value)}
               onPriorityObjectsChange={setPriorityObjects} onMinConfidenceChange={value => updateSettings({ objectThreshold: value / 100 })} onExportCSV={exportCSV} />
-            <PerformanceMonitor />
+            <PerformanceMonitor runtime={currentRuntime} />
           </aside>
         </main>
       </div>}
@@ -470,7 +490,9 @@ export default function Index() {
         <button onClick={() => setShowEmergency(false)} className="w-full text-sm">Dismiss (false alarm)</button>
       </div>}
       <TutorialOverlay steps={tutorialOverride || tutorialSteps} open={!liveView && showTutorial} onClose={() => { setShowTutorial(false); setTutorialOverride(null); }} onFinish={() => localStorage.setItem(user ? `msds-tutorial-done-${user.id}` : 'msds-tutorial-done-guest', '1')} />
-      <ExpertMode open={!liveView && showExpert} onClose={() => setShowExpert(false)} onSelectAlgorithm={openAlgorithmTutorial} />
+      <ExpertMode open={!liveView && showExpert} onClose={() => setShowExpert(false)} onSelectAlgorithm={openAlgorithmTutorial}
+        runtime={currentRuntime} settings={pipelineSettings} cameraLabel={slots[selectedCamera - 1]?.name}
+        attentionScore={attention} audioDistressScore={localAudioEnabled ? yamnet.distressScore : undefined} />
     </>
   );
 }

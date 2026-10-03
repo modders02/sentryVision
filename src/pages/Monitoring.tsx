@@ -6,6 +6,7 @@ import { useCamera } from '@/hooks/useCamera';
 import { useCameraSlots, slotCamera, slotSettings, type CameraSlot } from '@/hooks/useCameraSlots';
 import LiveCameraFeed from '@/components/multicam/LiveCameraFeed';
 import DashboardEvents from '@/components/dashboard/DashboardEvents';
+import AccessibilityPanel from '@/components/dashboard/AccessibilityPanel';
 
 /** Displays existing monitoring sessions; changing the view never starts another pipeline. */
 export default function Monitoring() {
@@ -47,6 +48,7 @@ export default function Monitoring() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-3">
+          <AccessibilityPanel />
           {!focused && (
             <div className="flex items-center gap-1 rounded-lg bg-muted/50 p-1" aria-label="Live camera layout">
               <button onClick={() => setColumns(1)} aria-label="One column" aria-pressed={columns === 1} className={`rounded-md p-2 transition-colors ${columns === 1 ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted'}`}><Columns2 className="h-4 w-4 rotate-90" /></button>
@@ -57,35 +59,38 @@ export default function Monitoring() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1600px] space-y-4 p-4 sm:p-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          {focused ? (
-            <button onClick={() => selectCamera(null)} className="flex items-center gap-2 text-sm font-semibold text-muted-foreground hover:text-foreground"><ArrowLeft className="h-4 w-4" /> All live cameras</button>
-          ) : (
-            <p className="text-sm text-muted-foreground">Select a camera to open its live feed, alerts, and event history.</p>
-          )}
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
+      <main className="mx-auto grid max-w-[1920px] items-start gap-5 p-4 sm:p-6 lg:grid-cols-[minmax(0,1fr)_320px] xl:grid-cols-[minmax(0,1fr)_360px]">
+        <section aria-label="Live camera panel" className="min-w-0 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            {focused ? (
+              <button onClick={() => selectCamera(null)} className="flex items-center gap-2 text-sm font-semibold text-muted-foreground hover:text-foreground"><ArrowLeft className="h-4 w-4" /> All live cameras</button>
+            ) : (
+              <p className="text-sm text-muted-foreground">Select a camera to open its live feed, alerts, and event history.</p>
+            )}
+          </div>
+          <div className={`grid items-start gap-5 ${focused || columns === 1 ? 'grid-cols-1' : 'grid-cols-1 xl:grid-cols-2'}`}>
+            {visible.map(slot => isConnected(slot) ? (
+              <LiveCameraFeed key={slot.index} camera={slotCamera(slot)} settings={slotSettings(slot, settings)} onExpand={focused ? undefined : selectCamera} onConnect={() => navigate(`/dashboard?connect=${slot.index}`)} />
+            ) : (
+              <button key={slot.index} onClick={() => navigate(`/dashboard?connect=${slot.index}`)} className="flex min-h-[300px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border bg-card/60 p-8 text-center transition-colors hover:border-primary hover:bg-primary/5">
+                <VideoOff className="h-8 w-8 text-muted-foreground" />
+                <span className="text-lg font-semibold">{slot.name || `Camera ${slot.index}`}</span>
+                <span className="text-sm text-muted-foreground">Camera not connected</span>
+                <span className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">Connect CCTV</span>
+              </button>
+            ))}
+          </div>
+        </section>
+        <aside aria-label="Camera activity sidebar" className="min-w-0 space-y-4 lg:sticky lg:top-5 lg:max-h-[calc(100vh-2.5rem)] lg:overflow-y-auto">
+          <label className="flex items-center gap-2 rounded-xl border border-border bg-card p-3 text-sm text-muted-foreground">
             View
-            <select aria-label="Choose live camera" value={focused || 'all'} onChange={event => selectCamera(event.target.value === 'all' ? null : event.target.value)} className="rounded-lg border border-border bg-card px-3 py-2 text-foreground">
+            <select aria-label="Choose live camera" value={focused || 'all'} onChange={event => selectCamera(event.target.value === 'all' ? null : event.target.value)} className="min-w-0 flex-1 rounded-lg border border-border bg-background px-3 py-2 text-foreground">
               <option value="all">All cameras</option>
               {includedSlots.map(slot => <option key={slot.index} value={`slot-${slot.index}`}>{slot.name || `Camera ${slot.index}`}</option>)}
             </select>
           </label>
-        </div>
-
-        <div className={`grid gap-5 ${focused || columns === 1 ? 'grid-cols-1' : 'grid-cols-1 lg:grid-cols-2'}`}>
-          {visible.map(slot => isConnected(slot) ? (
-            <LiveCameraFeed key={slot.index} camera={slotCamera(slot)} settings={slotSettings(slot, settings)} onExpand={focused ? undefined : selectCamera} onConnect={() => navigate(`/dashboard?connect=${slot.index}`)} />
-          ) : (
-            <button key={slot.index} onClick={() => navigate(`/dashboard?connect=${slot.index}`)} className="flex min-h-[300px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border bg-card/60 p-8 text-center transition-colors hover:border-primary hover:bg-primary/5">
-              <VideoOff className="h-8 w-8 text-muted-foreground" />
-              <span className="text-lg font-semibold">{slot.name || `Camera ${slot.index}`}</span>
-              <span className="text-sm text-muted-foreground">Camera not connected</span>
-              <span className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">Connect CCTV</span>
-            </button>
-          ))}
-        </div>
-        <DashboardEvents initialFilter={focused || 'all'} />
+          <DashboardEvents initialFilter={focused || 'all'} />
+        </aside>
       </main>
     </div>
   );

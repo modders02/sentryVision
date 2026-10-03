@@ -31,6 +31,9 @@ export interface FireDetectionResult {
   detected: boolean;             // real fire OR smoke-induced low-visibility emergency
   fireDetected: boolean;         // real fire signature confirmed
   smokeEmergency: boolean;       // smoke + low visibility
+  largeFire: boolean;
+  classification: 'none' | 'fire' | 'large-fire' | 'smoke' | 'electronics-with-fire';
+  screenFireRatio: number;
   confidence: number;            // 0..1 fused
   firePixelRatio: number;
   flickerScore: number;
@@ -53,6 +56,9 @@ export interface FireDetectorState {
   lastBbox: [number, number, number, number] | null;
   smoothBbox: [number, number, number, number] | null; // EMA-smoothed bbox
   missFrames: number;            // frames since last raw bbox (hold before clearing)
+  previousSamples: Float32Array | null;
+  previousFire: Uint8Array | null;
+  sampleSize: string;
 }
 
 export function createFireState(): FireDetectorState {
@@ -63,10 +69,18 @@ export function createFireState(): FireDetectorState {
     lastBbox: null,
     smoothBbox: null,
     missFrames: 0,
+    previousSamples: null,
+    previousFire: null,
+    sampleSize: '',
   };
 }
 
-const SCREEN_LABELS = new Set(['tv', 'cell phone', 'laptop', 'monitor']);
+const SCREEN_LABELS = new Set(['tv', 'cell phone', 'laptop', 'monitor', 'tablet', 'television']);
+export const FIRE_RULES = {
+  minFireRatio: 0.004, largeFireRatio: 0.05, minFlicker: 0.000002,
+  smokeCoverageHigh: 0.18, smokeWithFire: 0.08, visibilityLow: 45,
+  screenConfidence: 0.45, sampleStep: 4,
+} as const;
 
 const MIN_FIRE_RATIO = 0.004;
 const LIGHTER_AREA_RATIO = 0.002;
@@ -107,16 +121,6 @@ function smoothBbox(
   return undefined;
 }
 
-function bboxOverlap(a: [number, number, number, number], b: [number, number, number, number]) {
-  const [ax, ay, aw, ah] = a;
-  const [bx, by, bw, bh] = b;
-  const ix = Math.max(0, Math.min(ax + aw, bx + bw) - Math.max(ax, bx));
-  const iy = Math.max(0, Math.min(ay + ah, by + bh) - Math.max(ay, by));
-  const inter = ix * iy;
-  const area = aw * ah;
-  return area > 0 ? inter / area : 0;
-}
-
 export function detectFire(
   frame: ImageData,
   state: FireDetectorState,
@@ -124,6 +128,16 @@ export function detectFire(
 ): FireDetectionResult {
   const { data, width, height } = frame;
   const step = 4;
+  const sampledTotal = Math.max(1, Math.ceil(width / step) * Math.ceil(height / step));
+  if (state.sampleSize !== `${width}x${height}`) {
+    Object.assign(state, createFireState(), { sampleSize: `${width}x${height}` });
+  }
+  const screens = objects.filter(o => SCREEN_LABELS.has(o.label.toLowerCase()) && o.confidence >= FIRE_RULES.screenConfidence);
+  const screenAt = (x: number, y: number) => screens.find(({ bbox: [sx, sy, sw, sh] }) => x >= sx && x < sx + sw && y >= sy && y < sy + sh);
+  const samples = new Float32Array(sampledTotal).fill(-1);
+  const fireMask = new Uint8Array(sampledTotal);
+  let sampleIndex = 0, screenFireCount = 0, fireMotion = 0, smokeMotion = 0;
+  let screenLabel = '';
 
   // Single pass: fire pixels, smoke pixels, luminance stats, simple edge count.
   let fireCount = 0;
@@ -135,7 +149,7 @@ export function detectFire(
   let edgeCount = 0, edgeN = 0;
 
   for (let y = 0; y < height; y += step) {
-    for (let x = 0; x < width; x += step) {
+    for (let x = 0; x < width; x += step, sampleIndex++) {
       const i = (y * width + x) * 4;
       const r = data[i], g = data[i + 1], b = data[i + 2];
 
@@ -143,11 +157,25 @@ export function detectFire(
       const max = Math.max(r, g, b), min = Math.min(r, g, b);
       const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
       const sat = max === 0 ? 0 : (max - min) / max;
+      const flame = r > 200 && g > 100 && g < 200 && b < 100 && r > g + 40 && g > b + 20;
+      const smoke = sat < 0.18 && lum > 0.30 && lum < 0.88 && (max - min) < 30;
+      const screen = screenAt(x, y);
+      if (screen) {
+        if (flame) { screenFireCount++; screenLabel = screen.label; }
+        continue;
+      }
+      samples[sampleIndex] = lum;
+      fireMask[sampleIndex] = flame ? 1 : 0;
+      if (state.previousSamples && state.previousSamples[sampleIndex] >= 0) {
+        const difference = Math.abs(lum - state.previousSamples[sampleIndex]);
+        if (flame || state.previousFire?.[sampleIndex]) fireMotion += difference;
+        if (smoke) smokeMotion += difference;
+      }
       lumSum += lum; lumSqSum += lum * lum; lumN++;
       satSum += sat;
 
       // FIRE: strong red, mid green, low blue, R>G>B
-      if (r > 200 && g > 100 && g < 200 && b < 100 && r > g + 40 && g > b + 20) {
+      if (flame) {
         fireCount++;
         if (x < minX) minX = x;
         if (y < minY) minY = y;
@@ -156,12 +184,12 @@ export function detectFire(
       }
 
       // SMOKE: low saturation, mid-high luminance, near-grey (R≈G≈B), slight warm/cool ok
-      if (sat < 0.18 && lum > 0.30 && lum < 0.88 && (max - min) < 30) {
+      if (smoke) {
         smokeCount++;
       }
 
       // Edge sample: horizontal luminance gradient with neighbour `step` away
-      if (x + step < width) {
+      if (x + step < width && !screenAt(x + step, y)) {
         const j = (y * width + (x + step)) * 4;
         const lumN2 = (0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2]) / 255;
         if (Math.abs(lum - lumN2) > 0.08) edgeCount++;
@@ -170,7 +198,8 @@ export function detectFire(
     }
   }
 
-  const sampledTotal = Math.ceil(width / step) * Math.ceil(height / step);
+  state.previousSamples = samples;
+  state.previousFire = fireMask;
   const ratio = fireCount / sampledTotal;
   const smokeRatio = smokeCount / sampledTotal;
 
@@ -182,7 +211,7 @@ export function detectFire(
 
   // Visibility heuristic: high contrast + edges + saturation => clear (100).
   // Low contrast + few edges + desaturated + bright haze => smoke-blinded (0).
-  const visibility = Math.max(
+  const visibility = !lumN ? 100 : Math.max(
     0,
     Math.min(
       100,
@@ -198,8 +227,10 @@ export function detectFire(
   state.history.push(ratio);
   if (state.history.length > 10) state.history.shift();
   const mean = state.history.reduce((s, v) => s + v, 0) / state.history.length;
-  const variance =
-    state.history.reduce((s, v) => s + (v - mean) ** 2, 0) / state.history.length;
+  const variance = Math.max(
+    state.history.reduce((s, v) => s + (v - mean) ** 2, 0) / state.history.length,
+    (fireMotion / sampledTotal) ** 2,
+  );
 
   // Smoke + visibility temporal trend
   state.smokeHistory.push(smokeRatio);
@@ -208,8 +239,8 @@ export function detectFire(
   if (state.visibilityHistory.length > 12) state.visibilityHistory.shift();
 
   let bbox: [number, number, number, number] | undefined;
-  if (fireCount > 0 && maxX > minX && maxY > minY) {
-    bbox = [minX, minY, maxX - minX, maxY - minY];
+  if (fireCount > 0) {
+    bbox = [minX, minY, Math.min(width, maxX + step) - minX, Math.min(height, maxY + step) - minY];
     state.lastBbox = bbox;
   }
 
@@ -217,28 +248,32 @@ export function detectFire(
 
   // ---- Saliency score breakdown (0..100) ----
   const firePts = Math.min(40, (ratio / 0.05) * 40);
+  const screenPts = Math.min(40, ((ratio + screenFireCount / sampledTotal) / 0.05) * 40) - firePts;
   const flickerPts = Math.min(25, variance * 25000000);
   const smokePts = Math.min(20, (smokeRatio / SMOKE_COVERAGE_HIGH) * 20);
   const visPts = Math.min(15, ((100 - visibility) / 100) * 15);
-  const positive = firePts + flickerPts + smokePts + visPts;
+  const positive = firePts + screenPts + flickerPts + smokePts + visPts;
 
   const makeSaliency = (
     screenSuppression: number,
     otherSuppression: number,
     suppressionLabel?: string,
   ): SaliencyBreakdown => ({
-    fireColor: Math.round(firePts * 10) / 10,
+    fireColor: Math.round((firePts + screenPts) * 10) / 10,
     flicker: Math.round(flickerPts * 10) / 10,
     smoke: Math.round(smokePts * 10) / 10,
     visibility: Math.round(visPts * 10) / 10,
-    screenSuppression: -Math.round(screenSuppression * 10) / 10,
+    screenSuppression: -Math.round((screenSuppression + screenPts) * 10) / 10,
     otherSuppression: -Math.round(otherSuppression * 10) / 10,
-    total: Math.max(0, Math.round(positive - screenSuppression - otherSuppression)),
-    suppressed: screenSuppression + otherSuppression > 0,
-    suppressionLabel,
+    total: Math.max(0, Math.min(100, Math.round(positive - screenSuppression - screenPts - otherSuppression))),
+    suppressed: screenSuppression + screenPts + otherSuppression > 0,
+    suppressionLabel: suppressionLabel || (screenPts > 0 ? `Display pixels excluded (${screenLabel})` : undefined),
   });
 
   const baseResult = {
+    largeFire: ratio >= FIRE_RULES.largeFireRatio,
+    screenFireRatio: screenFireCount / sampledTotal,
+    classification: 'none' as FireDetectionResult['classification'],
     firePixelRatio: ratio,
     flickerScore: variance,
     smokeRatio,
@@ -252,16 +287,32 @@ export function detectFire(
 
   // ---- Smoke-only emergency (no flames visible yet, but room is filling) ----
   const smokeRising =
-    state.smokeHistory.length >= 6 &&
+    state.smokeHistory.length >= 2 &&
     state.smokeHistory[state.smokeHistory.length - 1] >
       state.smokeHistory[0] + 0.05;
   const visibilityDropping =
-    state.visibilityHistory.length >= 6 &&
+    state.visibilityHistory.length >= 2 &&
     state.visibilityHistory[0] - visibility > 15;
   const smokeEmergency =
     smokeRatio >= SMOKE_COVERAGE_HIGH &&
     visibility <= VISIBILITY_LOW &&
-    (smokeRising || visibilityDropping);
+    (smokeRising || visibilityDropping || (state.smokeHistory.length >= 3 && smokeMotion / sampledTotal > 0.01));
+  const largeFire = ratio >= FIRE_RULES.largeFireRatio;
+  const largeFireEmergency = state.history.length >= 2 && largeFire
+    && (smokeRatio >= FIRE_RULES.smokeWithFire || visibility <= VISIBILITY_LOW);
+  baseResult.classification = smokeEmergency ? 'smoke' : 'none';
+
+  // Exclude only display pixels. A real fire around a TV is still evaluated.
+  if (screenFireCount > 0 && ratio < MIN_FIRE_RATIO && !smokeEmergency) {
+    return {
+      ...baseResult, largeFire, screenFireRatio: screenFireCount / sampledTotal,
+      classification: 'electronics-with-fire',
+      detected: false, fireDetected: false, smokeEmergency: false, confidence: 0,
+      rejectedReason: `Electronics with fire: ${screenLabel} display footage`,
+      saliency: { ...makeSaliency(0, firePts + flickerPts), fireColor: firePts + screenPts,
+        screenSuppression: -screenPts, suppressed: true, suppressionLabel: `Fire inside ${screenLabel} display` },
+    };
+  }
 
   // ---- Fire rejection ladder ----
   if (ratio < MIN_FIRE_RATIO) {
@@ -292,42 +343,22 @@ export function detectFire(
       };
     }
 
-    // Screen / device false alarm — fire "inside" a TV/phone/laptop/monitor
-    // Trigger if the fire bbox mostly sits inside a screen OR the screen mostly
-    // sits inside the fire bbox (covers zoomed-in TVs that fill the frame).
-    for (const obj of objects) {
-      if (!SCREEN_LABELS.has(obj.label)) continue;
-      const fireInsideScreen = bboxOverlap(bbox, obj.bbox);
-      const screenInsideFire = bboxOverlap(obj.bbox, bbox);
-      if (fireInsideScreen > 0.4 || screenInsideFire > 0.5) {
-        return {
-          ...baseResult,
-          detected: false,
-          fireDetected: false,
-          smokeEmergency: false,
-          confidence: 0,
-          rejectedReason: `fire inside ${obj.label} screen — ignored`,
-          saliency: makeSaliency(positive, 0, `fire inside ${obj.label} screen`),
-        };
-      }
-    }
-
     // Poster / wallpaper guard: fire candidate sits in a very low-edge,
     // low-flicker region => printed/displayed surface, not a real flame.
-    if (edgeDensity < PLANAR_EDGE_DENSITY && variance < MIN_FLICKER * 2) {
+    if (edgeDensity < PLANAR_EDGE_DENSITY && variance < MIN_FLICKER * 2 && !largeFireEmergency) {
       return {
         ...baseResult,
-        detected: false,
+        detected: smokeEmergency,
         fireDetected: false,
-        smokeEmergency: false,
-        confidence: 0.15,
+        smokeEmergency,
+        confidence: smokeEmergency ? 0.6 + Math.min(0.3, smokeRatio) : 0.15,
         rejectedReason: 'flat planar region (poster / wallpaper / advert)',
         saliency: makeSaliency(0, positive, 'flat planar region (poster/wallpaper)'),
       };
     }
   }
 
-  if (state.history.length >= 5 && variance < MIN_FLICKER) {
+  if ((state.history.length < 2 || variance < MIN_FLICKER) && !largeFireEmergency) {
     return {
       ...baseResult,
       detected: smokeEmergency,
@@ -349,6 +380,7 @@ export function detectFire(
   const fireDetected = conf > 0.3;
   return {
     ...baseResult,
+    classification: fireDetected ? largeFire ? 'large-fire' : 'fire' : smokeEmergency ? 'smoke' : 'none',
     detected: fireDetected || smokeEmergency,
     fireDetected,
     smokeEmergency,

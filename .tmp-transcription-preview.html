@@ -1,0 +1,24 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="root"></div>
+<script type="module">
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { MemoryRouter } from 'react-router-dom';
+import Monitoring from '/src/pages/Monitoring.tsx';
+import { makeSlot } from '/src/hooks/useCameraSlots.ts';
+import { publishCameraSession, getCameraSession } from '/src/lib/cameraSessions.ts';
+import '/src/index.css';
+localStorage.clear();
+localStorage.setItem('msd-camera-slots-v1', JSON.stringify({ count: 2, slots: [1,2].map(index => ({...makeSlot(index), ip: '192.0.2.' + index, connected: true})) }));
+localStorage.setItem('msd-detection-events-v1', JSON.stringify(Array.from({length: 18}, (_, index) => ({id: String(index), cameraId: 'slot-1', cameraName: 'Camera 1', location: 'Living room', type: index % 2 ? 'audio-distress' : 'object', label: index % 2 ? 'Safety word: "help me"' : 'Person detected', confidence: .98, timestamp: new Date(Date.now() - index * 60000).toISOString()}))));
+for (let index of [1,2]) {
+  const home = document.createElement('div');
+  home.style.cssText = 'display:none';
+  document.body.appendChild(home);
+  const video = document.createElement('video');
+  video.poster = '/src/assets/camera-detect-original-1.jpg';
+  home.appendChild(video);
+  publishCameraSession('slot-' + index, {home, video, runtime: {cameraId:'slot-' + index,status:'online',fps:8,objects:[],fire:{detected:false,confidence:0},transcript:index===1 ? "I'm sorry, ".repeat(100) : 'Tulong, may tao sa pinto.',interimTranscript:'IGNORE THIS DRAFT',audioListening:true,audioMessage:'Listening.',audioTone:'ok'}});
+}
+window.previewSetTranscript = text => publishCameraSession('slot-1', {runtime:{...getCameraSession('slot-1').runtime,transcript:text}});
+createRoot(document.getElementById('root')).render(React.createElement(MemoryRouter,{initialEntries:['/cameras']},React.createElement(Monitoring)));
+</script></body></html>

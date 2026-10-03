@@ -3,6 +3,7 @@ import {
   loadCameras, saveCameras, loadSettings, saveSettings, loadEvents, saveEvents, makeCamera,
 } from '@/lib/cameraRegistry';
 import type { CameraConfig, DetectionEvent, MultiCamSettings } from '@/types/multicam';
+import { appendDetectionEvent, releaseRemovedClips } from '@/lib/alertHistory';
 
 const CAMERAS_EVT = 'msd-cameras-changed';
 const EVENTS_EVT = 'msd-events-changed';
@@ -59,20 +60,28 @@ export function useCameraRegistry() {
   }, []);
 
   const addEvent = useCallback((evt: DetectionEvent) => {
-    const next = [evt, ...loadEvents()];
+    const previous = loadEvents();
+    const next = appendDetectionEvent(previous, evt);
+    releaseRemovedClips(previous, next);
     saveEvents(next);
-    setEvents(next.slice(0, 500));
+    setEvents(next);
     window.dispatchEvent(new Event(EVENTS_EVT));
   }, []);
 
   const updateEvent = useCallback((id: string, patch: Partial<DetectionEvent>) => {
-    const next = loadEvents().map(e => (e.id === id ? { ...e, ...patch } : e));
+    const previous = loadEvents();
+    if (!previous.some(event => event.id === id)) {
+      if (patch.clipUrl?.startsWith('blob:')) URL.revokeObjectURL(patch.clipUrl);
+      return;
+    }
+    const next = previous.map(e => (e.id === id ? { ...e, ...patch } : e));
     saveEvents(next);
-    setEvents(next.slice(0, 500));
+    setEvents(next);
     window.dispatchEvent(new Event(EVENTS_EVT));
   }, []);
 
   const clearEvents = useCallback(() => {
+    releaseRemovedClips(loadEvents(), []);
     saveEvents([]);
     setEvents([]);
     window.dispatchEvent(new Event(EVENTS_EVT));

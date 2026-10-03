@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Camera, Maximize2, Mic, MicOff, RefreshCw, VideoOff, Volume2, VolumeX } from 'lucide-react';
 import { useCctvTalk } from '@/hooks/useCctvTalk';
 import { useCameraSession } from '@/lib/cameraSessions';
+import TranscriptionBox from './TranscriptionBox';
 import type { CameraConfig, MultiCamSettings } from '@/types/multicam';
 
 interface Props {
@@ -80,7 +81,7 @@ export default function LiveCameraFeed({ camera, settings, onExpand, onConnect }
   }, [runtime, video, camera.aiEnabled]);
 
   return (
-    <article className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+    <article className="min-w-0 overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
         <div className="min-w-0">
           <h2 className="truncate text-base font-semibold">{camera.name}</h2>
@@ -118,11 +119,13 @@ export default function LiveCameraFeed({ camera, settings, onExpand, onConnect }
         )}
         {talk.error && <div role="alert" className="absolute right-3 top-3 max-w-[80%] rounded-lg bg-destructive px-3 py-2 text-xs text-destructive-foreground">{talk.error}</div>}
       </div>
+      <TranscriptionBox cameraName={camera.name} transcript={runtime?.transcript} listening={runtime?.audioListening} message={runtime?.audioMessage} tone={runtime?.audioTone} />
       <div className="flex items-center justify-between gap-3 px-4 py-3 text-xs text-muted-foreground">
         <span className="flex items-center gap-1.5"><Camera className="h-3.5 w-3.5" />{camera.aiEnabled ? 'AI monitoring on' : 'AI monitoring off'}</span>
         {runtime?.status === 'online' && <span className="font-mono">{runtime.transport === 'webrtc' || runtime.transport === 'local' ? 'Realtime · ' : ''}{runtime.fps} FPS</span>}
       </div>
       {runtime?.playbackWarning && <p role="status" className="border-t border-border px-4 py-3 text-xs text-muted-foreground">{runtime.playbackWarning}</p>}
+      {runtime?.fire.classification === 'electronics-with-fire' && <p className="border-t border-border px-4 py-2 text-xs text-muted-foreground">{runtime.fire.rejectedReason}</p>}
     </article>
   );
 }

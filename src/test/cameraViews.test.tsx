@@ -1,9 +1,11 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Monitoring from '@/pages/Monitoring';
 import LiveCameraFeed from '@/components/multicam/LiveCameraFeed';
 import DashboardCameraCard from '@/components/dashboard/DashboardCameraCard';
+import DashboardEvents from '@/components/dashboard/DashboardEvents';
+import { NO_CLIP_FOLDER_MESSAGE, reportClipStatus } from '@/lib/clipRecorder';
 import { clearCameraSession, publishCameraSession } from '@/lib/cameraSessions';
 import { DEFAULT_SETTINGS, type CameraRuntime, type DetectionEvent } from '@/types/multicam';
 import { slotCamera, type CameraSlot } from '@/hooks/useCameraSlots';
@@ -174,6 +176,40 @@ describe('camera alerts and event history', () => {
     const recording = view.container.querySelector('video');
     expect(recording).toHaveAttribute('preload', 'none');
     expect(recording).not.toHaveAttribute('autoplay');
+  });
+
+  it('keeps camera filters, recording status, alerts and history in the camera activity sidebar', () => {
+    render(<MemoryRouter initialEntries={['/cameras']}><Monitoring /></MemoryRouter>);
+    const sidebar = screen.getByRole('complementary', { name: 'Camera activity sidebar' });
+    const cameraPanel = screen.getByRole('region', { name: 'Live camera panel' });
+    expect(within(sidebar).getByRole('combobox', { name: 'Choose live camera' })).toBeInTheDocument();
+    expect(within(sidebar).getByRole('combobox', { name: 'Filter events by camera' })).toBeInTheDocument();
+    expect(within(sidebar).getByRole('heading', { name: 'Camera alerts' })).toBeInTheDocument();
+    expect(within(sidebar).getByRole('heading', { name: 'Event history' })).toBeInTheDocument();
+    act(() => reportClipStatus({ state: 'error', message: NO_CLIP_FOLDER_MESSAGE }));
+    expect(screen.getAllByText(NO_CLIP_FOLDER_MESSAGE)).toHaveLength(1);
+    expect(within(sidebar).getByRole('status')).toHaveTextContent(NO_CLIP_FOLDER_MESSAGE);
+    expect(within(cameraPanel).queryByRole('combobox')).not.toBeInTheDocument();
+  });
+
+  it('opens the original alert snapshot from the consolidated activity panel', () => {
+    render(<MemoryRouter initialEntries={['/cameras?camera=slot-2']}><Monitoring /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('button', { name: 'View snapshot of Kitchen fire from Camera 2' }));
+    const dialog = screen.getByRole('dialog', { name: 'Kitchen fire' });
+    expect(within(dialog).getByRole('img', { name: 'Kitchen fire snapshot from Camera 2' })).toHaveAttribute('src', 'data:image/jpeg;base64,test');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('filters dashboard events without navigating away and honors hidden alerts', () => {
+    render(<MemoryRouter initialEntries={['/dashboard']}><DashboardEvents syncUrl={false} showAlerts={false} /><Location /></MemoryRouter>);
+    expect(screen.queryByRole('heading', { name: 'Camera alerts' })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Filter events by camera' }), { target: { value: 'slot-2' } });
+    expect(screen.queryByText('Lobby delivery')).not.toBeInTheDocument();
+    expect(screen.getByText('Kitchen fire')).toBeInTheDocument();
+    expect(screen.getByTestId('location')).toHaveTextContent(/^\/dashboard$/);
+    fireEvent.click(screen.getByRole('button', { name: 'View event snapshot of Kitchen fire from Camera 2' }));
+    expect(screen.getByRole('dialog', { name: 'Kitchen fire' })).toBeInTheDocument();
   });
 
   it('allows all history while a camera is focused and resets filters with All live cameras', () => {

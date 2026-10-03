@@ -11,8 +11,9 @@
  *
  * NOTE: written in CommonJS (.cjs) because package.json sets "type": "module".
  */
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
+const { createClipStorage } = require('./clipStorage.cjs');
 const { startLocalServer, stopLocalServer, getBootstrapStatus } = require('./localServer.cjs');
 
 const isDev = !app.isPackaged || process.env.MSDS_ELECTRON_DEV === '1';
@@ -26,6 +27,13 @@ const LOCAL_CAMERA_SERVER_URL = process.env.MSDS_CAMERA_SERVER_URL || 'http://12
 let mainWindow = null;
 /** Last result of the local-server startup attempt, surfaced to the renderer. */
 let localServerStatus = { managed: false, running: false, error: null };
+let clipStorage;
+
+function recordingStorage(event) {
+  if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error('Recording access is unavailable.');
+  if (!clipStorage) clipStorage = createClipStorage(path.join(app.getPath('userData'), 'recording-folder.json'));
+  return clipStorage;
+}
 
 
 function createWindow() {
@@ -80,6 +88,21 @@ ipcMain.handle('msds:openExternal', (_evt, url) => {
   if (typeof url === 'string' && /^https?:\/\//i.test(url)) shell.openExternal(url);
 });
 
+ipcMain.handle('msds:getClipFolder', event => recordingStorage(event).getFolder());
+ipcMain.handle('msds:forgetClipFolder', event => recordingStorage(event).setFolder(null));
+// The only recording dialog, invoked from the explicit Choose folder settings button.
+ipcMain.handle('msds:chooseClipFolder', async event => {
+  const storage = recordingStorage(event);
+  const choice = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose a folder for emergency recordings',
+    properties: ['openDirectory', 'createDirectory'],
+    defaultPath: await storage.getFolder() || undefined,
+  });
+  if (choice.canceled || !choice.filePaths[0]) return null;
+  return storage.setFolder(path.resolve(choice.filePaths[0]));
+});
+ipcMain.handle('msds:saveClip', (event, data, filename) => recordingStorage(event).save(data, filename));
+
 app.whenReady().then(() => {
   // Open the window immediately — the local bridge boots in parallel so a slow
   // or failing Python start never blocks the UI.
@@ -110,4 +133,3 @@ app.on('window-all-closed', () => {
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
-

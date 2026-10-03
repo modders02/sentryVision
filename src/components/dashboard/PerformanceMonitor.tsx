@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import { Activity } from 'lucide-react';
 import { perfMonitor, AI_RATES, type PerfSnapshot } from '@/lib/performance';
+import type { CameraRuntime } from '@/types/multicam';
 
 /**
  * Compact pipeline performance panel — samples the shared perf monitor at
  * ~2 Hz (the monitor's own roll rate), so it adds no measurable overhead.
  */
-export default function PerformanceMonitor() {
+export default function PerformanceMonitor({ runtime }: { runtime?: CameraRuntime }) {
   const [snap, setSnap] = useState<PerfSnapshot>(() => perfMonitor.get());
 
   useEffect(() => perfMonitor.subscribe(setSnap), []);
@@ -18,7 +19,14 @@ export default function PerformanceMonitor() {
       ? 'bg-success/20 text-success'
       : 'bg-muted text-muted-foreground';
 
-  const rows: Array<[string, string]> = [
+  const measured = (value?: number | null) => value == null ? 'Waiting' : `${value} ms`;
+  const rows: Array<[string, string]> = runtime ? [
+    ['Video FPS', String(runtime.fps)],
+    ['Visual analysis', measured(runtime.latencyMs)],
+    ['Object inference', measured(runtime.objectLatencyMs)],
+    ['Face inference', measured(runtime.faceLatencyMs)],
+    ['Transcription queue + decode', measured(runtime.audio?.transcription_latency_ms)],
+  ] : [
     ['Video FPS', snap.videoFps.toFixed(1)],
     ['AI FPS', snap.aiFps.toFixed(1)],
     ['Latency', `${snap.latencyMs} ms`],
@@ -32,7 +40,7 @@ export default function PerformanceMonitor() {
           <Activity className="w-3.5 h-3.5" /> Pipeline Performance
         </span>
         <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${statusColor}`}>
-          {snap.status}
+          {runtime ? runtime.status.toUpperCase() : snap.status}
         </span>
       </div>
 
@@ -46,9 +54,9 @@ export default function PerformanceMonitor() {
       </div>
 
       <p className="mt-2 text-[9px] font-mono text-muted-foreground leading-relaxed">
-        Targets — obj {AI_RATES.object}fps · sal {AI_RATES.saliency}fps · fire {AI_RATES.fire}fps · face {AI_RATES.face}fps · UI {AI_RATES.ui}Hz
+        {runtime ? 'Live checks up to 10 Hz; object and face jobs up to 5 Hz. Background stills 2 Hz; finalized transcription polled every 200 ms. Measured processing times exclude camera and network delay.' : `Targets — obj ${AI_RATES.object}fps · sal ${AI_RATES.saliency}fps · fire ${AI_RATES.fire}fps · face ${AI_RATES.face}fps · UI ${AI_RATES.ui}Hz`}
       </p>
-      {snap.status === 'THROTTLED' && (
+      {!runtime && snap.status === 'THROTTLED' && (
         <p className="text-[9px] font-mono text-warning">
           Adaptive throttle active — analysing at obj {snap.stageFps.object}fps / sal {snap.stageFps.saliency}fps.
         </p>

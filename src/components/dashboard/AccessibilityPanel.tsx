@@ -2,11 +2,13 @@ import { useState } from 'react';
 import { Accessibility, Contrast, Minus, Plus, RotateCcw, Volume2, X } from 'lucide-react';
 import { DEFAULT_SCALE, MAX_SCALE, MIN_SCALE, useAccessibility } from '@/hooks/useAccessibility';
 import { speak } from '@/lib/speech';
+import { useAccessibleDialog } from '@/hooks/useAccessibleDialog';
 
 export default function AccessibilityPanel() {
   const [open, setOpen] = useState(false);
-  const { fontScale, setFontScale, highContrast, setHighContrast, voiceGuide, setVoiceGuide, reset } =
+  const { fontScale, setFontScale, highContrast, setHighContrast, voiceGuide, setVoiceGuide, nativeScreenReader, setNativeScreenReader, reset } =
     useAccessibility();
+  const dialogRef = useAccessibleDialog(open, () => setOpen(false));
 
   return (
     <>
@@ -15,6 +17,8 @@ export default function AccessibilityPanel() {
         className="p-2 rounded-lg hover:bg-muted transition-colors"
         title="Accessibility — text size & high contrast"
         aria-label="Open accessibility settings"
+        aria-haspopup="dialog"
+        aria-expanded={open}
       >
         <Accessibility className="w-5 h-5 text-muted-foreground" />
       </button>
@@ -25,13 +29,16 @@ export default function AccessibilityPanel() {
           onClick={() => setOpen(false)}
         >
           <div
-            className="w-full max-w-lg bg-card border-2 border-border rounded-xl shadow-xl p-5 space-y-5"
+            ref={node => { dialogRef.current = node; }}
+            className="max-h-[90vh] w-full max-w-lg overflow-y-auto bg-card border-2 border-border rounded-xl shadow-xl p-5 space-y-5"
             onClick={e => e.stopPropagation()}
             role="dialog"
-            aria-label="Accessibility settings"
+            aria-modal="true"
+            aria-labelledby="accessibility-settings-title"
+            tabIndex={-1}
           >
             <div className="flex items-center justify-between">
-              <h2 className="text-2xl font-bold flex items-center gap-2">
+              <h2 id="accessibility-settings-title" className="text-2xl font-bold flex items-center gap-2">
                 <Accessibility className="w-6 h-6 text-primary" /> Accessibility
               </h2>
               <button
@@ -54,6 +61,7 @@ export default function AccessibilityPanel() {
                   onClick={() => setFontScale(fontScale - 5)}
                   className="p-3 rounded-lg border-2 border-border hover:border-primary"
                   aria-label="Decrease text size"
+                  disabled={fontScale <= MIN_SCALE}
                 >
                   <Minus className="w-5 h-5" />
                 </button>
@@ -64,6 +72,7 @@ export default function AccessibilityPanel() {
                   max={MAX_SCALE}
                   step={5}
                   value={fontScale}
+                  aria-valuetext={`${fontScale} percent text size`}
                   onChange={e => setFontScale(Number(e.target.value))}
                   className="flex-1 h-3 accent-primary cursor-pointer"
                 />
@@ -71,6 +80,7 @@ export default function AccessibilityPanel() {
                   onClick={() => setFontScale(fontScale + 5)}
                   className="p-3 rounded-lg border-2 border-border hover:border-primary"
                   aria-label="Increase text size"
+                  disabled={fontScale >= MAX_SCALE}
                 >
                   <Plus className="w-5 h-5" />
                 </button>
@@ -129,15 +139,32 @@ export default function AccessibilityPanel() {
                     : 'bg-background border-border hover:border-primary'
                 }`}
                 aria-pressed={voiceGuide}
+                aria-describedby="talking-mode-help"
               >
                 <span className="flex items-center gap-2 text-lg font-bold">
-                  <Volume2 className="w-5 h-5" /> Talking mode (for blind users)
+                  <Volume2 className="w-5 h-5" /> Talking mode
                 </span>
                 <span className="text-base font-bold">{voiceGuide ? 'ON' : 'OFF'}</span>
               </button>
-              <p className="text-base text-muted-foreground font-semibold">
-                MSDS reads every button, slider and alert out loud as you move with Tab or the mouse.
-                Press Escape any time to stop the voice.
+              <p id="talking-mode-help" className="text-base text-muted-foreground font-semibold">
+                Hear names, roles, values and states as you focus controls with Tab or explore with a mouse or touch.
+                Use Alt + Left/Right Arrow to explore headings and controls, and Enter or Space to activate.
+                Touch and drag to hear controls; tap to activate. Escape stops the voice.
+              </p>
+              <label className="flex items-start gap-3 rounded-lg border-2 border-border p-3 text-base font-semibold">
+                <input
+                  type="checkbox"
+                  checked={nativeScreenReader}
+                  onChange={event => setNativeScreenReader(event.target.checked)}
+                  aria-describedby="device-screen-reader-help"
+                  className="mt-1 h-5 w-5 accent-primary"
+                />
+                Use my device screen reader (TalkBack / VoiceOver)
+              </label>
+              <p id="device-screen-reader-help" className="text-sm text-muted-foreground">
+                Enable TalkBack or VoiceOver in your device accessibility settings. This option silences the app voice
+                while keeping accessible controls and live alert announcements available, so two voices do not overlap.
+                Use your screen reader&apos;s normal swipe, explore-by-touch and double-tap gestures.
               </p>
               <button
                 onClick={() =>

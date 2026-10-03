@@ -8,30 +8,17 @@ from typing import Optional
 import re
 
 from .binaries import pip_install_command
-from .config import WHISPER_MODEL
+from .config import (WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE,
+                     WHISPER_LANGUAGE, WHISPER_CPU_THREADS)
+from .streaming_audio import pcm_rms
 
-# Languages the household actually speaks. Anything else detected with very low
-# confidence is treated as noise rather than speech.
-ALLOWED_LANGUAGES = {"en", "tl", "fil"}
-
-# Phrases Whisper famously invents when it hears silence, hum or static.
+# Non-speech annotations. Ordinary words are never banned just because Whisper
+# sometimes hallucinates them; acoustic confidence and VAD do that filtering.
 HALLUCINATION_PATTERNS = [
-    r"^there'?s? (is )?something (in|over) there\.?$",
-    r"^thank(s| you)( for watching| very much)?[.!]?$",
-    r"^thanks for watching[.!]?$",
-    r"^please subscribe.*$",
-    r"^subtitles? by.*$",
-    r"^amara\.org.*$",
-    r"^sub(title)?s? (by|provided).*$",
-    r"^you[.!]?$",
-    r"^bye[.!]?$",
     r"^\.*$",
-    r"^(mm+|hm+|uh+|ah+|oh+)[.!]?$",
     r"^\[.*\]$",
     r"^\(.*\)$",
     r"^♪+.*♪*$",
-    r"^salamat sa panonood.*$",
-    r"^mag-?subscribe.*$",
 ]
 _HALLUCINATION_RE = [re.compile(p, re.IGNORECASE) for p in HALLUCINATION_PATTERNS]
 
@@ -43,57 +30,39 @@ KEEP_ALWAYS = {
 
 
 def _normalise_repetition(text: str) -> str:
-    """Collapse Whisper loops while preserving ordinary repeated speech.
+    """Normalize whitespace, retaining repetitions actually spoken by a user.
 
-    Noisy CCTV chunks can make Whisper emit the same word or sentence dozens
-    of times. Keeping at most two adjacent copies still represents emphasis
-    ("help, help") without filling the live panel with model hallucinations.
+    Silencing a repeated "help" or deleting ordinary phrases makes transcripts
+    less faithful. Acoustic evidence rejects decoder loops before this step.
     """
-    words = text.split()
-    if not words:
-        return ""
-
-    collapsed: list[str] = []
-    previous_key = ""
-    repeat_count = 0
-    for word in words:
-        key = re.sub(r"[^\w']", "", word, flags=re.UNICODE).lower()
-        if key and key == previous_key:
-            repeat_count += 1
-            if repeat_count > 2:
-                continue
-        else:
-            previous_key = key
-            repeat_count = 1
-        collapsed.append(word)
-
-    cleaned = " ".join(collapsed).strip()
-    # Also collapse adjacent repeated multi-word sentences/phrases.
-    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
-    unique_parts: list[str] = []
-    previous_part = ""
-    part_repeats = 0
-    for part in parts:
-        key = re.sub(r"[^\w']", " ", part, flags=re.UNICODE).lower()
-        key = " ".join(key.split())
-        if key and key == previous_part:
-            part_repeats += 1
-            if part_repeats > 2:
-                continue
-        else:
-            previous_part = key
-            part_repeats = 1
-        unique_parts.append(part)
-    return " ".join(unique_parts).strip()
+    return " ".join(text.split())
 
 
 def is_hallucination(text: str) -> bool:
     stripped = text.strip()
     if stripped.lower().strip(" .!?,").replace("!", "") in KEEP_ALWAYS:
         return False
-    if len(stripped) < 2:
+    if not any(char.isalnum() for char in stripped):
         return True
     return any(rx.match(stripped) for rx in _HALLUCINATION_RE)
+
+
+def _is_repetition_loop(segment, audio_duration: float = 0.0) -> bool:
+    """Reject compressed decoder loops at an implausible speaking rate.
+
+    Repetition alone is legitimate speech, including repeated calls for help.
+    Require both Whisper's compression warning and more than eight words per
+    second, with at least twelve words, rather than shortening the transcript.
+    """
+    if getattr(segment, "compression_ratio", 0.0) <= 2.4:
+        return False
+    words = re.findall(r"\w+(?:['’]\w+)*", segment.text or "")
+    if len(words) < 12:
+        return False
+    duration = max(0.0, getattr(segment, "end", 0.0) - getattr(segment, "start", 0.0))
+    if audio_duration > 0:
+        duration = min(duration, audio_duration) if duration > 0 else audio_duration
+    return duration > 0 and len(words) / max(0.1, duration) > 8.0
 
 
 class WhisperEngine:
@@ -132,8 +101,10 @@ class WhisperEngine:
                 from faster_whisper import WhisperModel
                 self.state = "loading"
                 try:
-                    # CPU-only, int8: works on every laptop, no GPU required.
-                    self.model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                    self.model = WhisperModel(
+                        WHISPER_MODEL, device=WHISPER_DEVICE,
+                        compute_type=WHISPER_COMPUTE_TYPE, cpu_threads=WHISPER_CPU_THREADS,
+                    )
                     self.error = None
                     self.state = "ready"
                 except Exception as exc:
@@ -147,52 +118,61 @@ class WhisperEngine:
         return self.model
 
     def transcribe(self, wav_path: str) -> str:
-        """Multilingual (English + Tagalog) transcription with hallucination guards.
+        return self._transcribe(wav_path)
 
-        Filters are tuned for real CCTV microphones: quiet, reverberant and noisy.
-        They must reject silence-driven phantom sentences without discarding
-        genuine (often short) speech such as "tulong" or "help".
-        """
+    def transcribe_pcm(self, pcm: bytes) -> str:
+        """Decode one finalized 16 kHz mono s16le phrase without a disk WAV."""
+        # Never run an acoustic decoder on empty/digital-silent input, even if
+        # a diagnostic or reconnect bypasses the live segmenter.
+        if not pcm or pcm_rms(pcm) < 1e-5:
+            return ""
+        import numpy as np
+        audio = np.frombuffer(pcm[:len(pcm) - len(pcm) % 2], dtype="<i2").astype(np.float32) / 32768.0
+        return self._transcribe(audio)
+
+    def _transcribe(self, audio) -> str:
         if not self.available:
             raise RuntimeError(self.error or "faster-whisper is not installed")
         model = self.load()
         with self.lock:
             segments, info = model.transcribe(
-                wav_path,
-                language=None,              # auto-detect (Tagalog, English, ...)
+                audio,
+                language=WHISPER_LANGUAGE,  # auto-detect unless explicitly configured
                 task="transcribe",          # never translate — keep "tulong" as "tulong"
                 vad_filter=True,
                 vad_parameters={
-                    "min_silence_duration_ms": 300,
-                    "threshold": 0.35,       # permissive: CCTV mics are quiet
-                    "min_speech_duration_ms": 200,
-                    "speech_pad_ms": 250,
+                    "min_silence_duration_ms": 200,
+                    "threshold": 0.5,        # Silero's default speech threshold
+                    "min_speech_duration_ms": 100,
+                    "speech_pad_ms": 150,
                 },
                 condition_on_previous_text=False,  # stops repeat/echo hallucinations
-                no_speech_threshold=0.8,
-                log_prob_threshold=-1.6,   # quiet CCTV mics give low-confidence real speech
-                temperature=[0.0, 0.2, 0.4],
+                no_speech_threshold=0.6,
+                log_prob_threshold=-1.0,
+                # Retry compressed/low-confidence output with modest sampling
+                # instead of returning a deterministic repetition loop.
+                temperature=(0.0, 0.2, 0.4),
+                compression_ratio_threshold=2.4,
                 beam_size=5,
-                initial_prompt="Tagalog at English na usapan sa bahay. Help, tulong, saklolo, sunog.",
+                word_timestamps=True,
+                hallucination_silence_threshold=0.8,
+                # No safety hotword prompt: it can invent an emergency in noise.
+                initial_prompt=None,
             )
-            lang = getattr(info, "language", "") or ""
-            lang_prob = getattr(info, "language_probability", 1.0) or 0.0
-            # Only reject when the detector is *really* unsure about a language
-            # nobody in the household speaks — that is where phantoms come from.
-            if lang not in ALLOWED_LANGUAGES and lang_prob < 0.35:
+            if getattr(info, "duration_after_vad", None) == 0:
                 return ""
-
             kept = []
             for seg in segments:
                 text = (seg.text or "").strip()
                 if not text:
                     continue
-                is_safety = any(w in text.lower() for w in KEEP_ALWAYS)
-                if not is_safety and getattr(seg, "no_speech_prob", 0.0) > 0.9:
+                if getattr(seg, "no_speech_prob", 0.0) > 0.85:
                     continue
-                if not is_safety and getattr(seg, "avg_logprob", 0.0) < -1.8:
+                if getattr(seg, "avg_logprob", 0.0) < -1.0:
                     continue
                 if is_hallucination(text):
+                    continue
+                if _is_repetition_loop(seg, getattr(info, "duration", 0.0)):
                     continue
                 kept.append(text)
             return _normalise_repetition(" ".join(kept).strip())

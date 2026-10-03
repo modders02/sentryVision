@@ -55,6 +55,15 @@ export interface CctvAudioStatus {
   last_chunk_at: string | null;
   last_transcription_at: string | null;
   last_transcript: string;
+  /** Legacy draft fields retained for older bridge responses. */
+  partial_transcript?: string;
+  partial_transcription_at?: string | null;
+  partial_utterance_id?: number | null;
+  /** Queue + model time measured from the submitted audio boundary. */
+  transcription_latency_ms?: number | null;
+  dropped_caption_jobs?: number;
+  caption_update_seconds?: number;
+  caption_silence_seconds?: number;
   /** null = not probed yet, false = the RTSP stream carries no audio track. */
   has_audio_track?: boolean | null;
   audio_codec?: string | null;
@@ -112,6 +121,12 @@ export function describeAudioStatus(
       tone: 'wait',
     };
   }
+  if (status.error?.startsWith('Whisper transcription failed:')) {
+    return { message: status.error, tone: 'error' };
+  }
+  if ((status.dropped_caption_jobs ?? 0) > 0) {
+    return { message: 'Listening. Some speech processing was skipped because the device could not keep up.', tone: 'wait' };
+  }
   if (!status.last_transcript) {
     return { message: 'Listening… no speech heard yet.', tone: 'wait' };
   }
@@ -124,6 +139,9 @@ const base = (url: string) => url.trim().replace(/\/+$/, '');
 
 async function req<T>(url: string, init?: RequestInit, timeoutMs = 20000): Promise<T> {
   const ctrl = new AbortController();
+  const abort = () => ctrl.abort();
+  init?.signal?.addEventListener('abort', abort, { once: true });
+  if (init?.signal?.aborted) ctrl.abort();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...init, signal: ctrl.signal, mode: 'cors' });
@@ -131,6 +149,7 @@ async function req<T>(url: string, init?: RequestInit, timeoutMs = 20000): Promi
     return (await res.json()) as T;
   } finally {
     clearTimeout(t);
+    init?.signal?.removeEventListener('abort', abort);
   }
 }
 
@@ -148,6 +167,7 @@ export async function getCameraSnapshot(
   server: string,
   id: string,
   signal?: AbortSignal,
+  monitoring = false,
 ): Promise<{ blob: Blob; timestamp: number }> {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -155,7 +175,7 @@ export async function getCameraSnapshot(
   if (signal?.aborted) controller.abort();
   const timeout = setTimeout(abort, 8000);
   try {
-    const response = await fetch(`${base(server)}/cameras/${encodeURIComponent(id)}/snapshot`, {
+    const response = await fetch(`${base(server)}/cameras/${encodeURIComponent(id)}/snapshot${monitoring ? '?monitoring=true' : ''}`, {
       signal: controller.signal,
       mode: 'cors',
       cache: 'no-store',
@@ -218,11 +238,13 @@ export const testCamera = (server: string, rtsp: string) =>
     `${base(server)}/test-connection`, json({ rtsp }), 25000);
 
 /** Audio distress events produced by ffmpeg -> Whisper on the backend. */
-export const getAudioEvents = (server: string, id: string, since?: string) =>
+export const AUDIO_POLL_INTERVAL_MS = 200;
+
+export const getAudioEvents = (server: string, id: string, since?: string, signal?: AbortSignal) =>
   req<{ events: AudioEvent[]; status: CctvAudioStatus }>(
-    `${base(server)}/cameras/${id}/audio-events${since ? `?since=${encodeURIComponent(since)}` : ''}`,
-    undefined,
-    20000,
+    `${base(server)}/cameras/${encodeURIComponent(id)}/audio-events${since ? `?since=${encodeURIComponent(since)}` : ''}`,
+    { signal, cache: 'no-store' },
+    4000,
   );
 
 export interface AudioTestReport {

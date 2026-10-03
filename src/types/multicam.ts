@@ -1,5 +1,6 @@
 import type { DetectedObject } from '@/types/dashboard';
 import type { CctvAudioStatus } from '@/lib/multiCamServer';
+import type { FireDetectionResult } from '@/lib/fireDetection';
 
 
 export type CameraStatus = 'offline' | 'connecting' | 'online' | 'error';
@@ -72,6 +73,8 @@ export interface CameraRuntime {
   error: string | null;
   fps: number;
   latencyMs: number;
+  objectLatencyMs?: number;
+  faceLatencyMs?: number;
   transport?: 'webrtc' | 'hls' | 'local';
   playbackWarning?: string | null;
   saliencyScore: number;
@@ -82,12 +85,16 @@ export interface CameraRuntime {
   frameWidth?: number;
   frameHeight?: number;
   humanCount: number;
-  fire: { detected: boolean; confidence: number; bbox?: [number, number, number, number] };
+  fire: { detected: boolean; confidence: number; bbox?: [number, number, number, number];
+    classification?: FireDetectionResult['classification']; rejectedReason?: string };
+  fireAnalysis?: FireDetectionResult;
   smoke: { detected: boolean; confidence: number };
   faceDistress: { detected: boolean; label: string; confidence: number };
   audioDistress: { detected: boolean; keyword: string; confidence: number; transcript: string };
-  /** Rolling live transcription of everything heard on this camera. */
+  /** Newest finalized utterance, cleared after five seconds. */
   transcript: string;
+  /** Legacy draft field; user transcription displays finalized speech only. */
+  interimTranscript?: string;
   /** True while transcripts are being polled from the backend. */
   audioListening: boolean;
   /** Compact per-camera audio/Whisper diagnostics from the local bridge. */

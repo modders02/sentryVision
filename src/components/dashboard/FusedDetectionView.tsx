@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import type { DetectedObject, AudioFeatures } from '@/types/dashboard';
 import { Maximize2, Minimize2, Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
+import TranscriptionBox from '@/components/multicam/TranscriptionBox';
 
 interface FusedDetectionViewProps {
   sourceCanvas: HTMLCanvasElement | null;
@@ -114,7 +115,6 @@ export default function FusedDetectionView({
   saliencyScore,
   active,
   transcript,
-  interimTranscript,
   speechListening,
   audioMessage,
   audioTone,
@@ -312,148 +312,122 @@ export default function FusedDetectionView({
   }, []);
 
   return (
-    <div id="tour-fused-view" ref={containerRef} className="relative bg-card rounded-md overflow-hidden border border-border panel-glow group flex flex-col">
-      {/* Header */}
-      <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between px-2 py-1 bg-gradient-to-b from-background/80 to-transparent">
-        <span className="text-[12px] font-semibold text-primary uppercase tracking-wider">
-          CAM 1 — Fused Detection
-        </span>
-        <div className="flex items-center gap-2">
-          <span className="text-[8px] font-mono px-1 py-0.5 rounded bg-accent/20 text-accent">AI+DISTRESS</span>
-          {distressLevel === 'critical' && (
-            <span className="text-[8px] font-mono px-1 py-0.5 rounded bg-destructive/80 text-destructive-foreground animate-pulse">ALERT</span>
-          )}
-          <span className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-success' : 'bg-destructive'}`} />
-        </div>
-      </div>
-
-      {/* Canvas */}
-      <canvas
-        ref={canvasRef}
-        width={640}
-        height={480}
-        className="w-full aspect-video object-contain bg-background"
-      />
-
-      {/* Live CCTV transcription with a plain-language reason when silent. */}
-      {(
-        <div
-          id="tour-live-transcription"
-          className="absolute left-2 top-8 z-10 max-w-[70%] rounded-md border border-border bg-background/85 px-2.5 py-1.5"
-          role="status"
-          aria-live="polite"
-        >
-          <div className="mb-0.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-primary">
-            <Mic className="h-3 w-3" /> Live transcription
+    <div id="tour-fused-view" ref={containerRef} className="relative min-w-0 bg-card rounded-md overflow-hidden border border-border panel-glow group flex flex-col">
+      <div className="relative">
+        {/* Header */}
+        <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between px-2 py-1 bg-gradient-to-b from-background/80 to-transparent">
+          <span className="text-[12px] font-semibold text-primary uppercase tracking-wider">
+            CAM 1 — Fused Detection
+          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-[8px] font-mono px-1 py-0.5 rounded bg-accent/20 text-accent">AI+DISTRESS</span>
+            {distressLevel === 'critical' && (
+              <span className="text-[8px] font-mono px-1 py-0.5 rounded bg-destructive/80 text-destructive-foreground animate-pulse">ALERT</span>
+            )}
+            <span className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-success' : 'bg-destructive'}`} />
           </div>
-          <p className="max-h-24 overflow-y-auto text-[13px] leading-snug text-foreground">
-            {transcript}
-            {interimTranscript && (
-              <span className="text-muted-foreground">{transcript ? ' ' : ''}{interimTranscript}</span>
-            )}
-            {!transcript && !interimTranscript && (
-              <span className={audioTone === 'error' ? 'text-destructive' : 'text-muted-foreground'}>
-                {audioMessage || (speechListening ? 'Listening… no speech yet' : 'Listening is off')}
-              </span>
-            )}
-          </p>
-          {audioDiagnostic && (
-            <p className="mt-1 text-[10px] font-mono text-muted-foreground">{audioDiagnostic}</p>
-          )}
         </div>
-      )}
 
+        {/* Canvas */}
+        <canvas
+          ref={canvasRef}
+          width={640}
+          height={480}
+          className="w-full aspect-video object-contain bg-background"
+        />
 
+        {/* Fullscreen button */}
+        <button
+          onClick={toggleFullscreen}
+          className="absolute bottom-2 right-2 z-20 p-1.5 rounded bg-background/70 hover:bg-background border border-border hover:border-primary/50 transition-all group-hover:opacity-100 opacity-60"
+          title={isFullscreen ? 'Exit fullscreen' : 'Fit to screen'}
+        >
+          {isFullscreen ? <Minimize2 className="w-3.5 h-3.5 text-primary" /> : <Maximize2 className="w-3.5 h-3.5 text-primary" />}
+        </button>
 
-      {/* Fullscreen button */}
-      <button
-        onClick={toggleFullscreen}
-        className="absolute bottom-2 right-2 z-20 p-1.5 rounded bg-background/70 hover:bg-background border border-border hover:border-primary/50 transition-all group-hover:opacity-100 opacity-60"
-        title={isFullscreen ? 'Exit fullscreen' : 'Fit to screen'}
-      >
-        {isFullscreen ? <Minimize2 className="w-3.5 h-3.5 text-primary" /> : <Maximize2 className="w-3.5 h-3.5 text-primary" />}
-      </button>
-
-      {/* CCTV speaker toggle — hear the camera's own audio */}
-      <button
-        onClick={() => onToggleCctvAudio?.()}
-        disabled={!cctvAudioAvailable}
-        className={`absolute bottom-2 right-[4.5rem] z-20 p-1.5 rounded border transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
-          cctvAudioEnabled
-            ? 'bg-primary/20 border-primary/60'
-            : 'bg-background/70 border-border hover:border-primary/50'
-        }`}
-        title={
-          !cctvAudioAvailable
-            ? 'Connect a CCTV stream to hear its audio'
-            : cctvAudioEnabled
-              ? 'Speaker ON — you hear the camera. Muting only stops playback; wake-word listening keeps running.'
-              : 'Speaker OFF (playback muted). Wake-word listening and audio analysis keep running.'
-        }
-        aria-label="Toggle CCTV speaker playback (does not affect microphone listening)"
-        aria-pressed={cctvAudioEnabled}
-
-      >
-        {cctvAudioEnabled
-          ? <Volume2 className="w-3.5 h-3.5 text-primary animate-pulse" />
-          : <VolumeX className="w-3.5 h-3.5 text-muted-foreground" />}
-      </button>
-
-      {/* Push-to-talk — speak out of the CCTV speaker */}
-      <button
-        onMouseDown={() => onTalkStart?.()}
-        onMouseUp={() => onTalkStop?.()}
-        onMouseLeave={() => talking && onTalkStop?.()}
-        onTouchStart={e => { e.preventDefault(); onTalkStart?.(); }}
-        onTouchEnd={e => { e.preventDefault(); onTalkStop?.(); }}
-        className={`absolute bottom-2 right-10 z-20 p-1.5 rounded border transition-all ${
-          talking
-            ? 'bg-destructive/30 border-destructive'
-            : speechListening
-              ? 'bg-success/20 border-success/50'
+        {/* CCTV speaker toggle — hear the camera's own audio */}
+        <button
+          onClick={() => onToggleCctvAudio?.()}
+          disabled={!cctvAudioAvailable}
+          className={`absolute bottom-2 right-[4.5rem] z-20 p-1.5 rounded border transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+            cctvAudioEnabled
+              ? 'bg-primary/20 border-primary/60'
               : 'bg-background/70 border-border hover:border-primary/50'
-        }`}
-        title={
-          talkError
-            ? `Talk failed: ${talkError}`
-            : talking
-              ? 'Release to send your voice to the CCTV speaker'
-              : 'Hold to talk — your voice plays out of the CCTV speaker'
-        }
-        aria-label="Hold to talk through the CCTV speaker"
-        aria-pressed={talking}
-      >
-        {talking ? (
-          <Mic className="w-3.5 h-3.5 text-destructive animate-pulse" />
-        ) : speechListening ? (
-          <Mic className="w-3.5 h-3.5 text-success" />
-        ) : (
-          <MicOff className="w-3.5 h-3.5 text-muted-foreground" />
-        )}
-      </button>
+          }`}
+          title={
+            !cctvAudioAvailable
+              ? 'Connect a CCTV stream to hear its audio'
+              : cctvAudioEnabled
+                ? 'Speaker ON — you hear the camera. Muting only stops playback; wake-word listening keeps running.'
+                : 'Speaker OFF (playback muted). Wake-word listening and audio analysis keep running.'
+          }
+          aria-label="Toggle CCTV speaker playback (does not affect microphone listening)"
+          aria-pressed={cctvAudioEnabled}
 
-      {/* Status badges */}
-      <div className="absolute bottom-2 left-1 z-10 flex gap-1">
-        <span className={`text-[9px] font-mono px-1 py-0.5 rounded ${
-          active ? 'bg-success/20 text-success' : 'bg-muted/50 text-muted-foreground'
-        }`}>
-          {active ? 'FUSED' : 'OFFLINE'}
-        </span>
-        <span className={`text-[9px] font-mono px-1 py-0.5 rounded ${
-          distressLevel === 'critical' ? 'bg-destructive/20 text-destructive animate-pulse' :
-          attentionScore > 70 ? 'bg-destructive/20 text-destructive' :
-          attentionScore > 40 ? 'bg-warning/20 text-warning' :
-          'bg-success/20 text-success'
-        }`}>
-          α:{attentionScore}
-        </span>
-      </div>
+        >
+          {cctvAudioEnabled
+            ? <Volume2 className="w-3.5 h-3.5 text-primary animate-pulse" />
+            : <VolumeX className="w-3.5 h-3.5 text-muted-foreground" />}
+        </button>
 
-      {!active && (
-        <div className="absolute inset-0 flex items-center justify-center bg-background/80">
-          <span className="text-xs font-mono text-muted-foreground">NO SIGNAL</span>
+        {/* Push-to-talk — speak out of the CCTV speaker */}
+        <button
+          onMouseDown={() => onTalkStart?.()}
+          onMouseUp={() => onTalkStop?.()}
+          onMouseLeave={() => talking && onTalkStop?.()}
+          onTouchStart={e => { e.preventDefault(); onTalkStart?.(); }}
+          onTouchEnd={e => { e.preventDefault(); onTalkStop?.(); }}
+          className={`absolute bottom-2 right-10 z-20 p-1.5 rounded border transition-all ${
+            talking
+              ? 'bg-destructive/30 border-destructive'
+              : speechListening
+                ? 'bg-success/20 border-success/50'
+                : 'bg-background/70 border-border hover:border-primary/50'
+          }`}
+          title={
+            talkError
+              ? `Talk failed: ${talkError}`
+              : talking
+                ? 'Release to send your voice to the CCTV speaker'
+                : 'Hold to talk — your voice plays out of the CCTV speaker'
+          }
+          aria-label="Hold to talk through the CCTV speaker"
+          aria-pressed={talking}
+        >
+          {talking ? (
+            <Mic className="w-3.5 h-3.5 text-destructive animate-pulse" />
+          ) : speechListening ? (
+            <Mic className="w-3.5 h-3.5 text-success" />
+          ) : (
+            <MicOff className="w-3.5 h-3.5 text-muted-foreground" />
+          )}
+        </button>
+
+        {/* Status badges */}
+        <div className="absolute bottom-2 left-1 z-10 flex gap-1">
+          <span className={`text-[9px] font-mono px-1 py-0.5 rounded ${
+            active ? 'bg-success/20 text-success' : 'bg-muted/50 text-muted-foreground'
+          }`}>
+            {active ? 'FUSED' : 'OFFLINE'}
+          </span>
+          <span className={`text-[9px] font-mono px-1 py-0.5 rounded ${
+            distressLevel === 'critical' ? 'bg-destructive/20 text-destructive animate-pulse' :
+            attentionScore > 70 ? 'bg-destructive/20 text-destructive' :
+            attentionScore > 40 ? 'bg-warning/20 text-warning' :
+            'bg-success/20 text-success'
+          }`}>
+            α:{attentionScore}
+          </span>
         </div>
-      )}
+
+        {!active && (
+          <div className="absolute inset-0 flex items-center justify-center bg-background/80">
+            <span className="text-xs font-mono text-muted-foreground">NO SIGNAL</span>
+          </div>
+        )}
+      </div>
+      <TranscriptionBox id="tour-live-transcription" cameraName="Camera 1" transcript={transcript} listening={speechListening} message={audioMessage} tone={audioTone} />
+      {audioDiagnostic && <p className="max-h-12 overflow-y-auto break-words border-t border-border px-3 py-2 text-[10px] font-mono text-muted-foreground">{audioDiagnostic}</p>}
     </div>
   );
 }

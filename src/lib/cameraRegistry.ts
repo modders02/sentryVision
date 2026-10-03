@@ -8,7 +8,7 @@ import {
 const CAMERAS_KEY = 'msd-cameras-v1';
 const SETTINGS_KEY = 'msd-multicam-settings-v1';
 const EVENTS_KEY = 'msd-detection-events-v1';
-const MAX_EVENTS = 500;
+const MAX_EVENTS = 100; // 50 safety alerts plus 50 informational sightings.
 
 const read = <T,>(key: string, fallback: T): T => {
   try {
@@ -44,7 +44,7 @@ export const saveCameras = (cams: CameraConfig[]) => write(CAMERAS_KEY, cams);
 export const loadSettings = (): MultiCamSettings => read(SETTINGS_KEY, DEFAULT_SETTINGS);
 export const saveSettings = (s: MultiCamSettings) => write(SETTINGS_KEY, s);
 
-export const loadEvents = (): DetectionEvent[] => readArray<DetectionEvent>(EVENTS_KEY);
+export const loadEvents = (): DetectionEvent[] => readArray<DetectionEvent>(EVENTS_KEY).slice(0, MAX_EVENTS);
 export const saveEvents = (e: DetectionEvent[]) => write(EVENTS_KEY, e.slice(0, MAX_EVENTS));
 
 export function makeCamera(partial: Partial<CameraConfig>): CameraConfig {

@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { describeAudioStatus, getAudioEvents, type CctvAudioStatus } from '@/lib/multiCamServer';
-
-/** The live transcript is wiped this long after the last words were heard. */
-const TRANSCRIPT_CLEAR_MS = 5000;
+import { AUDIO_POLL_INTERVAL_MS, describeAudioStatus, getAudioEvents, type CctvAudioStatus } from '@/lib/multiCamServer';
+import { latestFinalTranscript, transcriptRemainingMs } from '@/lib/transcription';
 
 export interface CctvSpeechDiagnostics {
   polling: boolean;
@@ -15,9 +13,10 @@ export interface CctvSpeechDiagnostics {
   whisperState: string | null;
   lastTranscriptionAt: string | null;
   lastTranscript: string;
+  transcriptionLatencyMs: number | null;
+  droppedCaptionJobs: number;
   ffmpegError: string | null;
   error: string | null;
-  /** Short sentence for the operator: why words are (not) appearing. */
   message: string;
   tone: 'ok' | 'wait' | 'error';
 }
@@ -25,116 +24,99 @@ export interface CctvSpeechDiagnostics {
 const IDLE: CctvSpeechDiagnostics = {
   polling: false, backendReachable: false, audioConnected: false, threadRunning: false,
   hasAudioTrack: null, audioSource: null, chunksReceived: 0, whisperState: null, lastTranscriptionAt: null,
-  lastTranscript: '', ffmpegError: null, error: null,
+  lastTranscript: '', transcriptionLatencyMs: null, droppedCaptionJobs: 0, ffmpegError: null, error: null,
   message: 'Connect the camera to start listening.', tone: 'wait',
 };
 
-/**
- * Speech coming from the CCTV camera itself.
- *
- * The laptop microphone is never used here — the backend transcribes the
- * camera's RTSP audio with Whisper and we poll those transcripts.
- */
+/** Original-language finalized camera speech; each utterance replaces the previous one. */
 export function useCctvSpeech(server: string, cameraId: string, enabled: boolean) {
   const [transcript, setTranscript] = useState('');
+  const [interimTranscript, setInterimTranscript] = useState('');
   const [listening, setListening] = useState(false);
   const [diagnostics, setDiagnostics] = useState<CctvSpeechDiagnostics>(IDLE);
-  const sinceRef = useRef<string | undefined>(undefined);
-  const lastShownRef = useRef('');
   const clearTimerRef = useRef<number | undefined>(undefined);
 
-  /**
-   * The newest Whisper sentence always REPLACES the previous one — CCTV text is
-   * never accumulated — and it disappears 5 s after the last words were heard.
-   */
-  const showTranscript = useCallback((text: string) => {
-    setTranscript(text);
+  const clear = useCallback(() => {
     if (clearTimerRef.current) window.clearTimeout(clearTimerRef.current);
-    clearTimerRef.current = window.setTimeout(() => setTranscript(''), TRANSCRIPT_CLEAR_MS);
+    clearTimerRef.current = undefined;
+    setTranscript('');
+    setInterimTranscript('');
   }, []);
 
-  useEffect(() => () => { if (clearTimerRef.current) window.clearTimeout(clearTimerRef.current); }, []);
-
   useEffect(() => {
+    clear();
     if (!enabled) {
       setListening(false);
-      setDiagnostics(prev => ({ ...prev, polling: false, message: IDLE.message, tone: 'wait' }));
+      setDiagnostics(IDLE);
       return;
     }
     let cancelled = false;
-    let inFlight = false;
+    let since: string | undefined;
+    let shownRevision = '';
+    let timer: number | undefined;
+    let request: AbortController | null = null;
     setListening(true);
-    setDiagnostics(prev => ({ ...prev, polling: true, error: null, message: 'Starting to listen…', tone: 'wait' }));
+    setDiagnostics({ ...IDLE, polling: true, message: 'Starting to listen…' });
 
     const applyStatus = (status: CctvAudioStatus) => {
       const described = describeAudioStatus(status, true);
       setDiagnostics({
-        polling: true,
-        backendReachable: true,
-        audioConnected: status.connected,
-        threadRunning: status.thread_running,
-        hasAudioTrack: status.has_audio_track ?? null,
-        audioSource: status.audio_source ?? null,
-        chunksReceived: status.chunks_received ?? 0,
-        whisperState: status.whisper_state ?? null,
-        lastTranscriptionAt: status.last_transcription_at,
-        lastTranscript: status.last_transcript ?? '',
-        ffmpegError: status.ffmpeg_error ?? null,
-        error: status.error,
-        message: described.message,
-        tone: described.tone,
+        polling: true, backendReachable: true,
+        audioConnected: status.connected, threadRunning: status.thread_running,
+        hasAudioTrack: status.has_audio_track ?? null, audioSource: status.audio_source ?? null,
+        chunksReceived: status.chunks_received ?? 0, whisperState: status.whisper_state ?? null,
+        lastTranscriptionAt: status.last_transcription_at, lastTranscript: status.last_transcript ?? '',
+        transcriptionLatencyMs: status.transcription_latency_ms ?? null,
+        droppedCaptionJobs: status.dropped_caption_jobs ?? 0,
+        ffmpegError: status.ffmpeg_error ?? null, error: status.error,
+        ...described,
       });
     };
 
     const tick = async () => {
-      if (inFlight) return;
-      inFlight = true;
+      if (cancelled) return;
+      request = new AbortController();
+      let delay = AUDIO_POLL_INTERVAL_MS;
       try {
-        const res = await getAudioEvents(server, cameraId, sinceRef.current);
+        const res = await getAudioEvents(server, cameraId, since, request.signal);
         if (cancelled) return;
         applyStatus(res.status);
-        const events = res?.events ?? [];
-        if (events.length) {
-          sinceRef.current = events[events.length - 1].timestamp;
-          const text = events.map(e => e.transcript).filter(Boolean).join(' ').trim();
-          if (text && text !== lastShownRef.current) {
-            lastShownRef.current = text;
-            console.info(`[CCTV Speech ${cameraId}]`, text);
-            showTranscript(text);
+        const newest = res.events?.at(-1);
+        if (newest) since = newest.timestamp;
+        const final = latestFinalTranscript(res.events ?? [], res.status);
+        const revision = final ? `${final.timestamp}:${final.text}` : '';
+        if (final && revision !== shownRevision) {
+          shownRevision = revision;
+          clear();
+          const remaining = transcriptRemainingMs(final.timestamp);
+          if (final.text && remaining > 0) {
+            setTranscript(final.text);
+            clearTimerRef.current = window.setTimeout(clear, remaining);
           }
-          return;
-        }
-        // No new event this poll, but the backend may already hold words.
-        const last = res.status?.last_transcript ?? '';
-        if (last && last !== lastShownRef.current) {
-          lastShownRef.current = last;
-          showTranscript(last);
         }
       } catch (error) {
         if (!cancelled) {
+          delay = 1500;
           const message = error instanceof Error ? error.message : String(error);
-          console.warn(`[CCTV Speech ${cameraId}] polling failed:`, message);
           setDiagnostics(prev => ({
-            ...prev,
-            polling: true,
-            backendReachable: false,
-            audioConnected: false,
-            error: message,
-            message: `${describeAudioStatus(null, false).message} (${message})`,
-            tone: 'error',
+            ...prev, polling: true, backendReachable: false, audioConnected: false, error: message,
+            message: `${describeAudioStatus(null, false).message} (${message})`, tone: 'error',
           }));
         }
       } finally {
-        inFlight = false;
+        request = null;
+        if (!cancelled) timer = window.setTimeout(tick, delay);
       }
     };
-
     void tick();
-    const id = window.setInterval(tick, 1500);
-    return () => { cancelled = true; setListening(false); window.clearInterval(id); };
-  }, [server, cameraId, enabled, showTranscript]);
+    return () => {
+      cancelled = true;
+      request?.abort();
+      if (timer) window.clearTimeout(timer);
+      if (clearTimerRef.current) window.clearTimeout(clearTimerRef.current);
+      setListening(false);
+    };
+  }, [server, cameraId, enabled, clear]);
 
-  const clear = useCallback(() => setTranscript(''), []);
-
-  return { transcript, listening, clear, diagnostics };
+  return { transcript, interimTranscript, listening, clear, diagnostics };
 }

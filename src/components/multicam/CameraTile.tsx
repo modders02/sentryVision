@@ -5,8 +5,9 @@ import {
 } from 'lucide-react';
 import { useCameraPipeline } from '@/hooks/useCameraPipeline';
 import { useCctvTalk } from '@/hooks/useCctvTalk';
-import { clipFileName, recordClip, saveClip } from '@/lib/clipRecorder';
+import { clipFileName, EMERGENCY_CLIP_SECONDS, recordClip, saveClip } from '@/lib/clipRecorder';
 import type { CameraConfig, DetectionEvent, MultiCamSettings } from '@/types/multicam';
+import TranscriptionBox from './TranscriptionBox';
 
 interface Props {
   camera: CameraConfig;
@@ -46,14 +47,17 @@ export default function CameraTile({
     const video = videoRef.current;
     if (!video || typeof id !== 'string') return id;
     recordingRef.current = true;
-    setClipNote('Recording a 10 second clip…');
+    setClipNote(`Recording a ${EMERGENCY_CLIP_SECONDS} second clip…`);
     void recordClip(video)
       .then(async blob => {
         if (!blob) { setClipNote('Could not record a clip from this camera.'); return; }
-        const name = clipFileName(camera.name, evt.type);
+        const name = clipFileName(camera.name, evt.type, blob.type);
         const where = await saveClip(blob, name);
         onClip?.(id, name, URL.createObjectURL(blob));
         setClipNote(`Clip saved to ${where}`);
+      })
+      .catch(error => {
+        setClipNote(error instanceof Error ? error.message : 'Could not save the recording to the selected folder.');
       })
       .finally(() => {
         recordingRef.current = false;
@@ -118,7 +122,7 @@ export default function CameraTile({
   );
 
   return (
-    <div className="relative bg-card border border-border rounded-lg overflow-hidden flex flex-col">
+    <div className="relative min-w-0 bg-card border border-border rounded-lg overflow-hidden flex flex-col">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-border gap-2">
         <div className="min-w-0">
@@ -179,22 +183,6 @@ export default function CameraTile({
         />
         <canvas ref={overlayRef} className="absolute inset-0 w-full h-full pointer-events-none" />
 
-        {/* Live transcription of what this camera hears */}
-        {camera.enabled && (
-          <div className="absolute top-2 left-2 z-10 max-w-[70%] rounded-md bg-background/85 border border-border px-2.5 py-1.5">
-            <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-primary">
-              <Mic className="w-3 h-3" /> Live transcription
-            </div>
-            <p aria-live="polite" className="mt-0.5 max-h-20 overflow-y-auto text-[13px] leading-snug text-foreground">
-              {runtime.transcript || (
-                <span className={runtime.audioTone === 'error' ? 'text-destructive' : 'text-muted-foreground'}>
-                  {runtime.audioMessage}
-                </span>
-              )}
-            </p>
-          </div>
-        )}
-
         {runtime.status !== 'online' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-background/80 text-center px-3">
             <VideoOff className="w-7 h-7 text-muted-foreground" />
@@ -209,7 +197,7 @@ export default function CameraTile({
           </div>
         )}
         {clipNote && (
-          <div className="absolute bottom-10 left-2 z-10 rounded bg-background/90 border border-border text-[12px] px-2 py-1">
+          <div role="status" aria-live="polite" className="absolute bottom-10 left-2 z-10 rounded bg-background/90 border border-border text-[12px] px-2 py-1">
             {clipNote}
           </div>
         )}
@@ -219,6 +207,8 @@ export default function CameraTile({
           </div>
         )}
       </div>
+
+      {camera.enabled && <TranscriptionBox cameraName={camera.name} transcript={runtime.transcript} listening={runtime.audioListening} message={runtime.audioMessage} tone={runtime.audioTone} />}
 
       {/* Stats */}
       {!compact && (

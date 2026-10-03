@@ -20,6 +20,7 @@ from .config import HLS_PORT, RTSP_PORT, WHISPER_MODEL
 from .manager import (CAMERAS, mediamtx_running, snapshot, start_mediamtx,
                       stop_all_cameras, sync_cameras)
 from .whisper_engine import WHISPER
+from .frame_cache import get_monitoring_frame, FrameUnavailable, close_all as close_monitoring_frames
 
 app = FastAPI(title="MSDSystem multi-camera bridge")
 app.add_middleware(
@@ -43,6 +44,10 @@ class _CameraSnapshot:
 
 _SNAPSHOTS: dict[str, _CameraSnapshot] = {}
 _SNAPSHOT_LOCK = threading.Lock()
+_RECORDING_CAMERAS: set[str] = set()
+_RECORDING_LOCK = threading.Lock()
+RECORD_SECONDS = 10
+RECORD_TIMEOUT = 20
 
 
 def _snapshot_generation(cam) -> tuple:
@@ -86,7 +91,7 @@ def find_camera(camera_id: str):
 
 
 @app.get("/cameras/{camera_id}/snapshot")
-def camera_snapshot(camera_id: str):
+def camera_snapshot(camera_id: str, monitoring: bool = False):
     """Return one small still from the shared local stream, never a video feed.
 
     This synchronous route runs in FastAPI's thread pool. Requests for the same
@@ -96,6 +101,16 @@ def camera_snapshot(camera_id: str):
     cam = find_camera(camera_id)
     if cam is None:
         raise HTTPException(status_code=404, detail="Unknown camera")
+    if monitoring:
+        if not cam.enabled or not cam.running() or not mediamtx_running():
+            raise HTTPException(status_code=503, detail="Camera is offline or disabled")
+        try:
+            image, timestamp = get_monitoring_frame(cam)
+        except FrameUnavailable as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+        return Response(content=image, media_type="image/jpeg", headers={
+            "Cache-Control": "no-store", "X-Snapshot-Timestamp": str(timestamp),
+        })
     state = _snapshot_state(cam)
     with state.lock:
         if not cam.enabled or not cam.running() or not mediamtx_running():
@@ -148,6 +163,56 @@ def camera_snapshot(camera_id: str):
             content=state.image, media_type="image/jpeg",
             headers={"Cache-Control": "no-store", "X-Snapshot-Timestamp": str(state.timestamp)},
         )
+
+
+@app.post("/cameras/{camera_id}/record")
+def camera_recording(camera_id: str):
+    """Record the shared local stream; no UI, picker, or extra CCTV connection.
+
+    A synchronous route uses FastAPI's worker pool so audio polls continue
+    during the ten-second capture. The renderer saves the returned MP4 to its
+    previously authorized folder.
+    """
+    cam = find_camera(camera_id)
+    if cam is None:
+        raise HTTPException(status_code=404, detail="Unknown camera")
+    if not cam.enabled or not cam.running() or not mediamtx_running():
+        raise HTTPException(status_code=503, detail="Camera is offline or disabled")
+    ffmpeg = resolve_exe("ffmpeg", "FFMPEG_EXE")
+    if not ffmpeg:
+        raise HTTPException(status_code=503, detail="FFmpeg is unavailable on the camera service")
+    with _RECORDING_LOCK:
+        if cam.id in _RECORDING_CAMERAS:
+            raise HTTPException(status_code=409, detail="This camera is already recording an emergency clip")
+        _RECORDING_CAMERAS.add(cam.id)
+    generation = _snapshot_generation(cam)
+    try:
+        out = subprocess.run(
+            [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-rtsp_transport", "tcp", "-timeout", "5000000", "-threads", "1",
+             "-i", f"rtsp://127.0.0.1:{RTSP_PORT}/{cam.path}",
+             "-map", "0:v:0", "-map", "0:a:0?", "-t", str(RECORD_SECONDS),
+             "-c:v", "copy", "-c:a", "aac", "-b:a", "64k", "-threads", "1",
+             "-movflags", "+frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"],
+            capture_output=True, timeout=RECORD_TIMEOUT, creationflags=no_window_flags(),
+        )
+        if out.returncode != 0 or not out.stdout or out.stdout[4:8] != b"ftyp":
+            raise HTTPException(status_code=503, detail="Could not record an emergency clip from this camera")
+        if generation != _snapshot_generation(cam) or not cam.enabled or not cam.running():
+            raise HTTPException(status_code=503, detail="Camera changed or disconnected during recording")
+        return Response(content=out.stdout, media_type="video/mp4", headers={"Cache-Control": "no-store"})
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Timed out recording the emergency clip")
+    except (OSError, subprocess.SubprocessError):
+        raise HTTPException(status_code=503, detail="Could not record an emergency clip from this camera")
+    finally:
+        with _RECORDING_LOCK:
+            _RECORDING_CAMERAS.discard(cam.id)
+
+
+@app.on_event("shutdown")
+def close_frame_decoders():
+    close_monitoring_frames()
 
 
 @app.get("/status")

@@ -23,9 +23,16 @@ VIDEO_THREADS = max(1, min(4, int(os.environ.get("MSD_VIDEO_THREADS", 2))))
 VIDEO_GOP = max(1, VIDEO_FPS // 2)
 
 MAX_CAMERAS = 16
-# Length of each WAV segment fed to Whisper. Shorter = more responsive UI.
-AUDIO_CHUNK_SECONDS = max(2, int(os.environ.get("MSD_AUDIO_CHUNK_SECONDS", 4)))
-WHISPER_MODEL = os.environ.get("MSD_WHISPER_MODEL", "base")
+# Decode complete phrases once; a longer window preserves sentence context.
+AUDIO_CHUNK_SECONDS = max(1.0, min(15.0, float(os.environ.get("MSD_AUDIO_CHUNK_SECONDS", 6))))
+AUDIO_SILENCE_SECONDS = max(0.2, min(1.0, float(os.environ.get("MSD_AUDIO_SILENCE_SECONDS", 0.6))))
+# This gate only avoids decoding digital silence. Whisper VAD verifies speech.
+AUDIO_MIN_RMS = max(0.0, min(0.05, float(os.environ.get("MSD_AUDIO_MIN_RMS", 0.001))))
+WHISPER_MODEL = os.environ.get("MSD_WHISPER_MODEL", "small")
+WHISPER_DEVICE = os.environ.get("MSD_WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.environ.get("MSD_WHISPER_COMPUTE_TYPE", "int8" if WHISPER_DEVICE == "cpu" else "float16")
+WHISPER_LANGUAGE = os.environ.get("MSD_WHISPER_LANGUAGE", "").strip() or None
+WHISPER_CPU_THREADS = max(1, min(8, int(os.environ.get("MSD_WHISPER_CPU_THREADS", 4))))
 
 
 # How long a positive HLS probe stays valid (seconds). Avoids one HTTP request

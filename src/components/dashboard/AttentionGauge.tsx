@@ -11,7 +11,7 @@ export default function AttentionGauge({ score, label = 'Attention Score' }: Att
   return (
     <div className="bg-card rounded-md border border-border panel-glow p-3 flex flex-col items-center">
       <span className="text-[10px] font-mono text-primary uppercase tracking-wider mb-2">{label}</span>
-      <div className="relative w-24 h-24">
+      <div role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={score} tabIndex={0} className="relative w-24 h-24">
         <svg className="w-full h-full -rotate-90" viewBox="0 0 100 100">
           <circle
             cx="50" cy="50" r="40"
@@ -27,7 +27,7 @@ export default function AttentionGauge({ score, label = 'Attention Score' }: Att
             strokeLinecap="round"
             strokeDasharray={circumference}
             strokeDashoffset={offset}
-            className="transition-all duration-300"
+            className="transition-all duration-100 motion-reduce:transition-none"
           />
         </svg>
         <div className="absolute inset-0 flex items-center justify-center">
