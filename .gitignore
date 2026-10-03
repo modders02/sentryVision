@@ -48,3 +48,7 @@ yarn-debug.log*
 .DS_Store
 Thumbs.db
 .vscode/
+local-server/.venv/
+local-server/models/
+.tmp-transcription-check.mjs
+.tmp-transcription-preview.html
