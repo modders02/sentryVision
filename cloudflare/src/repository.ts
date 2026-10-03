@@ -45,7 +45,7 @@ class MemoryRepository implements MsdsRepository {
 class SupabaseRepository implements MsdsRepository {
   constructor(private url: string, private key: string) {}
 
-  private async rest(path: string, init: RequestInit = {}) {
+  private async rest<T = unknown>(path: string, init: RequestInit = {}): Promise<T | null> {
     const res = await fetch(`${this.url.replace(/\/+$/, '')}/rest/v1/${path}`, {
       ...init,
       headers: {
@@ -57,7 +57,7 @@ class SupabaseRepository implements MsdsRepository {
       },
     });
     if (!res.ok) throw new Error(`supabase ${res.status}: ${await res.text()}`);
-    return res.status === 204 ? null : await res.json();
+    return res.status === 204 ? null : await res.json() as T;
   }
 
   async upsertDevice(d: DeviceRecord) {
@@ -68,7 +68,7 @@ class SupabaseRepository implements MsdsRepository {
     return d;
   }
   async getDevice(id: string) {
-    const rows: any[] = await this.rest(`msds_devices?device_id=eq.${encodeURIComponent(id)}&limit=1`);
+    const rows = await this.rest<any[]>(`msds_devices?device_id=eq.${encodeURIComponent(id)}&limit=1`) ?? [];
     const r = rows?.[0];
     return r ? { deviceId: r.device_id, name: r.name, version: r.version, platform: r.platform, lastSeenAt: r.last_seen_at, online: r.online, status: r.status } : null;
   }
@@ -88,7 +88,7 @@ class SupabaseRepository implements MsdsRepository {
   }
   async listAlerts(deviceId?: string, limit = 100) {
     const filter = deviceId ? `device_id=eq.${encodeURIComponent(deviceId)}&` : '';
-    const rows: any[] = await this.rest(`msds_alerts?${filter}order=created_at.desc&limit=${limit}`);
+    const rows = await this.rest<any[]>(`msds_alerts?${filter}order=created_at.desc&limit=${limit}`) ?? [];
     return rows.map(r => ({ id: r.id, deviceId: r.device_id, cameraId: r.camera_id, type: r.type, label: r.label, confidence: r.confidence, createdAt: r.created_at, meta: r.meta }));
   }
   async insertDetection(d: DetectionRecord) {
@@ -99,7 +99,7 @@ class SupabaseRepository implements MsdsRepository {
   }
   async listDetections(deviceId?: string, limit = 100) {
     const filter = deviceId ? `device_id=eq.${encodeURIComponent(deviceId)}&` : '';
-    const rows: any[] = await this.rest(`msds_detections?${filter}order=created_at.desc&limit=${limit}`);
+    const rows = await this.rest<any[]>(`msds_detections?${filter}order=created_at.desc&limit=${limit}`) ?? [];
     return rows.map(r => ({ id: r.id, deviceId: r.device_id, cameraId: r.camera_id, kind: r.kind, payload: r.payload, createdAt: r.created_at }));
   }
 }
