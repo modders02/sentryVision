@@ -124,9 +124,6 @@ export function describeAudioStatus(
   if (status.error?.startsWith('Whisper transcription failed:')) {
     return { message: status.error, tone: 'error' };
   }
-  if ((status.dropped_caption_jobs ?? 0) > 0) {
-    return { message: 'Listening. Some speech processing was skipped because the device could not keep up.', tone: 'wait' };
-  }
   if (!status.last_transcript) {
     return { message: 'Listening… no speech heard yet.', tone: 'wait' };
   }
