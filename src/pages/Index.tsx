@@ -21,11 +21,11 @@ import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
 import { useAuth } from '@/hooks/useAuth';
 import { useHousehold } from '@/hooks/useHousehold';
 import { useCameraRegistry } from '@/hooks/useCameraRegistry';
-import { loadServerHost, serverUrlFor, useCameraSlots, type SlotCount } from '@/hooks/useCameraSlots';
+import { loadServerHost, serverUrlFor, slotPath, slotRtsp, useCameraSlots, type SlotCount } from '@/hooks/useCameraSlots';
 import { useWakeLock } from '@/hooks/useWakeLock';
 import { announce } from '@/lib/voiceGuide';
 import { sendAlertEmail } from '@/lib/alertEmail';
-import { stopAll as stopAllCameras, stopCamera } from '@/lib/multiCamServer';
+import { getMultiStatus, startCamera, stopAll as stopAllCameras, stopCamera, syncCameras } from '@/lib/multiCamServer';
 import { matchWakeWord } from '@/lib/safetyLexicon';
 import { getCameraSession } from '@/lib/cameraSessions';
 import { appendAlertBatch } from '@/lib/alertHistory';
@@ -193,6 +193,63 @@ export default function Index() {
     setHintsSuppressed(running || connected.length > 0);
     return () => setHintsSuppressed(false);
   }, [running, connected.length]);
+
+  // The Python bridge keeps its camera registry in memory. Electron may restart
+  // that process while the renderer keeps the user's slots in localStorage, so
+  // repopulate the bridge and revive cameras that were previously connected.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    let reconciling = false;
+    const server = serverUrlFor(loadServerHost());
+
+    const reconcileBridge = async () => {
+      if (cancelled || reconciling) return;
+      reconciling = true;
+      try {
+        const configuredSlots = slots.filter(slot => slot.ip.trim());
+        const payload = configuredSlots.map(slot => ({
+          id: `slot-${slot.index}`,
+          path: slotPath(slot),
+          name: slot.name || `Camera ${slot.index}`,
+          location: slot.ip ? `Camera IP ${slot.ip}` : '',
+          rtspUrl: slotRtsp(slot),
+          enabled: true,
+          aiEnabled: slot.aiEnabled,
+          recording: false,
+          createdAt: new Date(0).toISOString(),
+        }));
+
+        const before = await getMultiStatus(server);
+        const expected = new Set(payload.map(camera => camera.id));
+        const registered = new Set(before.cameras.map(camera => camera.id));
+        const registryMismatch = expected.size !== registered.size
+          || [...expected].some(id => !registered.has(id));
+
+        if (registryMismatch) await syncCameras(server, payload);
+
+        const status = registryMismatch ? await getMultiStatus(server) : before;
+        for (const slot of configuredSlots) {
+          if (!slot.connected || cancelled) continue;
+          const id = `slot-${slot.index}`;
+          const camera = status.cameras.find(item => item.id === id);
+          if (!camera?.ffmpeg) await startCamera(server, id);
+        }
+      } catch {
+        // Startup is intentionally race-safe: the bridge may still be loading
+        // Whisper/MediaMTX. The next retry will reconcile once port 5000 is ready.
+      } finally {
+        reconciling = false;
+        if (!cancelled) timer = window.setTimeout(reconcileBridge, 4000);
+      }
+    };
+
+    void reconcileBridge();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [slots]);
 
   const openConnection = useCallback((index: number) => {
     if (index > count) setCount(index as SlotCount);
