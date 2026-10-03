@@ -370,6 +370,7 @@ class Camera:
         generation = object()
         self._caption_generation = generation
         self._latest_audio_utterance = 0
+        self.dropped_caption_jobs = 0
         self.last_transcript = ""
         # A fresh empty result prevents event history from reviving old words
         # while a newly started audio worker is waiting for its first phrase.
