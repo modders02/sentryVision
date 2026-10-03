@@ -217,6 +217,23 @@ function childEnv(dir) {
     const p = path.join(bin, name + ext);
     if (fs.existsSync(p)) env[key] = p;
   }
+  // Prefer a manually downloaded local faster-whisper model when present.
+  // This avoids first-run Hugging Face downloads on machines that already have
+  // local-server/models/faster-whisper-small populated.
+  const localWhisperModel = path.join(dir, 'models', 'faster-whisper-small');
+  if (!env.MSD_WHISPER_MODEL && fs.existsSync(path.join(localWhisperModel, 'model.bin'))) {
+    env.MSD_WHISPER_MODEL = localWhisperModel;
+  }
+
+  // Stable CPU defaults for live CCTV transcription. Every value remains
+  // overrideable through the environment for faster/slower machines.
+  if (!env.MSD_WHISPER_DEVICE) env.MSD_WHISPER_DEVICE = 'cpu';
+  if (!env.MSD_WHISPER_COMPUTE_TYPE) env.MSD_WHISPER_COMPUTE_TYPE = 'int8';
+  if (!env.MSD_WHISPER_CPU_THREADS) env.MSD_WHISPER_CPU_THREADS = '4';
+  if (!env.MSD_AUDIO_MIN_RMS) env.MSD_AUDIO_MIN_RMS = '0.0005';
+  if (!env.MSD_AUDIO_SILENCE_SECONDS) env.MSD_AUDIO_SILENCE_SECONDS = '0.6';
+  if (!env.MSD_AUDIO_CHUNK_SECONDS) env.MSD_AUDIO_CHUNK_SECONDS = '6';
+
   return env;
 }
 
