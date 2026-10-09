@@ -9,6 +9,7 @@ import ControlsPanel from '@/components/dashboard/ControlsPanel';
 import AttentionGauge from '@/components/dashboard/AttentionGauge';
 import DetectionFeedback from '@/components/dashboard/DetectionFeedback';
 import PerformanceMonitor from '@/components/dashboard/PerformanceMonitor';
+import ValidationLayer from '@/components/dashboard/ValidationLayer';
 import TutorialOverlay, { type TutorialStep } from '@/components/dashboard/TutorialOverlay';
 import ExpertMode, { type AlgorithmId } from '@/components/dashboard/ExpertMode';
 import AccessibilityPanel from '@/components/dashboard/AccessibilityPanel';
@@ -27,6 +28,7 @@ import { announce } from '@/lib/voiceGuide';
 import { sendAlertEmail } from '@/lib/alertEmail';
 import { getMultiStatus, startCamera, stopAll as stopAllCameras, stopCamera, syncCameras } from '@/lib/multiCamServer';
 import { matchWakeWord } from '@/lib/safetyLexicon';
+import { SAFETY_VALIDATION_REPEAT_MS, validateSafetySpeech } from '@/lib/safetyValidation';
 import { getCameraSession } from '@/lib/cameraSessions';
 import { appendAlertBatch } from '@/lib/alertHistory';
 import { clipFileName, recordClip, saveClip, restoreClipFolder, getClipFolderLabel, reportClipStatus, NO_CLIP_FOLDER_MESSAGE } from '@/lib/clipRecorder';
@@ -156,6 +158,7 @@ export default function Index() {
   const alertCooldown = useRef(new Map<string, number>());
   const recordingCameras = useRef(new Set<string>());
   const householdMatches = useRef(new Map<number, { phrase: string; at: number }>());
+  const localSafetyValidationRef = useRef<{ phrase: string; at: number } | null>(null);
   const previousConnections = useRef(new Set<number>());
   const connected = slots.filter(slot => slot.connected);
   const localCameras = cameras.filter(camera => camera.active && camera.stream);
@@ -360,7 +363,26 @@ export default function Index() {
     if (!running || !localCameras.length || connected.length) return;
     const text = speech.transcript.trim();
     const household = checkForWakeWord(text);
-    const safety = matchWakeWord(text);
+    const rawSafety = matchWakeWord(text);
+    let safetyValidation = validateSafetySpeech(text, {
+      fireDetected: currentRuntime?.fire.detected,
+      smokeDetected: currentRuntime?.smoke.detected,
+    });
+    if (safetyValidation.status === 'pending' && safetyValidation.match.matched) {
+      const previous = localSafetyValidationRef.current;
+      const now = Date.now();
+      const repeated = previous?.phrase === safetyValidation.match.phrase
+        && now - previous.at <= SAFETY_VALIDATION_REPEAT_MS;
+      localSafetyValidationRef.current = { phrase: safetyValidation.match.phrase, at: now };
+      safetyValidation = validateSafetySpeech(text, {
+        fireDetected: currentRuntime?.fire.detected,
+        smokeDetected: currentRuntime?.smoke.detected,
+        repeated,
+      });
+    } else if (safetyValidation.status === 'validated') {
+      localSafetyValidationRef.current = null;
+    }
+    const safety = safetyValidation.status === 'validated' ? rawSafety : { ...rawSafety, matched: false };
     if (!household.matched && !safety.matched) return;
     const phrase = household.matched ? household.phrase : safety.phrase;
     const emergency = household.matched ? household.isEmergency : safety.severity === 'critical';
@@ -369,7 +391,7 @@ export default function Index() {
       label: `Wake word: "${phrase}"`, confidence: household.matched ? 1 : safety.confidence,
       timestamp: new Date().toISOString(), snapshot: getCameraSession('slot-1').preview || undefined,
     }, emergency ? 'critical' : 'high');
-  }, [running, localCameras.length, connected.length, speech.transcript, speech.transcriptRevision, checkForWakeWord, slots, raiseAlert]);
+  }, [running, localCameras.length, connected.length, speech.transcript, speech.transcriptRevision, checkForWakeWord, slots, raiseAlert, currentRuntime?.fire.detected, currentRuntime?.smoke.detected]);
 
   useEffect(() => {
     if (!running || !localCameras.length || connected.length || !['scream', 'bang'].includes(audioFeatures.audioEvent)) return;
@@ -518,6 +540,7 @@ export default function Index() {
               <p className="mt-2 text-center text-sm text-muted-foreground">{running ? 'Snapshot detection and audio triggers are active.' : 'Connect a camera, then start monitoring.'}</p>
             </div>
             <AttentionGauge score={attention} />
+            <ValidationLayer runtime={currentRuntime} cameraLabel={slots[selectedCamera - 1]?.name || `Camera ${selectedCamera}`} transcriptOverride={selectedCamera === 1 && localAudioEnabled ? speech.transcript : undefined} />
             <div id="tour-alert-log"><DashboardEvents syncUrl={false} showAlerts={showAlerts} /></div>
             <ControlsPanel snapshotMode running={running} threshold={settings.saliencyThreshold ?? 40} showBoundingBoxes={showBoundingBoxes} showHeatmap={showHeatmap} showAlerts={showAlerts}
               quality={quality} mirror={mirror} heatmapOpacity={heatmapOpacity} simulationMode={simulationMode} priorityObjects={priorityObjects} minConfidence={Math.round(settings.objectThreshold * 100)}
