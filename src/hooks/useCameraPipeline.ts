@@ -7,7 +7,7 @@ import { createFireState, detectFire } from '@/lib/fireDetection';
 import { describeAudioStatus, getAudioEvents, getCameraSnapshot } from '@/lib/multiCamServer';
 import { latestFinalTranscript, transcriptRemainingMs, TRANSCRIPT_CLEAR_MS } from '@/lib/transcription';
 import { useFaceDistress } from '@/hooks/useFaceDistress';
-import { matchWakeWord } from '@/lib/safetyLexicon';
+import { SAFETY_VALIDATION_REPEAT_MS, validateSafetySpeech } from '@/lib/safetyValidation';
 import type {
   CameraConfig, CameraRuntime, DetectionEvent, MultiCamSettings,
 } from '@/types/multicam';
@@ -129,6 +129,7 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
   const audioSourceRef = useRef('');
   const clearTimerRef = useRef<number | undefined>(undefined);
   const audioDistressTimerRef = useRef<number | undefined>(undefined);
+  const speechValidationRef = useRef<{ phrase: string; at: number } | null>(null);
 
   const cooldownRef = useRef<Record<string, number>>({});
   const retryRef = useRef(0);
@@ -655,10 +656,38 @@ export function useCameraPipeline({ camera, settings, onEvent, managedVideo = fa
           for (const e of fresh) {
             // Retained event history belongs in the sidebar, not in new alerts.
             if (transcriptRemainingMs(e.timestamp) === 0) continue;
-            // Backend keyword list OR the full Tagalog/English safety library.
-            const safety = matchWakeWord(e.transcript || '');
-            const keyword = safety.matched ? safety.phrase : e.keyword;
-            const confidence = Math.max(e.confidence || 0, safety.matched ? safety.confidence : 0);
+            // Backend keyword list OR the Tagalog/English safety library.
+            // Short single-word fire phrases are held until visual evidence or
+            // a second matching utterance confirms the ASR result.
+            const transcript = e.transcript || '';
+            const candidate = validateSafetySpeech(transcript, {
+              fireDetected: runtimeRef.current.fire.detected,
+              smokeDetected: runtimeRef.current.smoke.detected,
+              repeated: false,
+            });
+            let safety = candidate;
+            if (candidate.status === 'pending' && candidate.match.matched) {
+              const previous = speechValidationRef.current;
+              const now = Date.now();
+              const repeated = previous?.phrase === candidate.match.phrase
+                && now - previous.at <= SAFETY_VALIDATION_REPEAT_MS;
+              speechValidationRef.current = { phrase: candidate.match.phrase, at: now };
+              safety = validateSafetySpeech(transcript, {
+                fireDetected: runtimeRef.current.fire.detected,
+                smokeDetected: runtimeRef.current.smoke.detected,
+                repeated,
+              });
+              if (safety.status !== 'validated') continue;
+            } else if (candidate.status === 'validated') {
+              speechValidationRef.current = null;
+            }
+            const keyword = safety.status === 'validated' && safety.match.matched
+              ? safety.match.phrase
+              : e.keyword;
+            const confidence = Math.max(
+              e.confidence || 0,
+              safety.status === 'validated' && safety.match.matched ? safety.match.confidence : 0,
+            );
             if (!keyword || confidence < settings.audioThreshold) continue;
             patch({
               audioDistress: {
